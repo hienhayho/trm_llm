@@ -1,0 +1,49 @@
+[
+  {
+    "type": "function",
+    "function": {
+      "name": "realtime_aqi",
+      "description": "Weather forecast. Get real-time air quality, including current air quality, PM2.5, and PM10 information.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "city": {
+            "type": "string",
+            "description": "City name, e.g., Shanghai"
+          }
+        },
+        "required": ["city"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "calculator",
+      "description": "Perform mathematical operations",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "a": {"type": "number"},
+          "b": {"type": "number"},
+          "op": {"type": "string", "enum": ["add", "subtract", "multiply", "divide"]}
+        },
+        "required": ["a", "b", "op"]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "search_web",
+      "description": "Search the web",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "query": {"type": "string"}
+        },
+        "required": ["query"]
+      }
+    }
+  }
+]
