@@ -6,17 +6,21 @@ Integrates all components:
 - Action state module (updates y based on z)
 - Output heads (decode y into decisions)
 - Deep supervision loop (progressively improves answer)
+
+Supports loading pretrained embeddings from models like Qwen, LLaMA, etc.
 """
 
 import torch
 import torch.nn as nn
 from typing import Optional, Dict, List
 
-from ..utils.config import TRMLLMConfig
-from .transformer_blocks import TransformerEncoder, PositionalEncoding
-from .reasoning_module import RecursiveReasoningModule
-from .action_module import ActionStateModule
-from .output_heads import OutputHeads, ParameterGenerationHead, ResponseGenerationHead
+from trm_llm.utils.config import TRMLLMConfig
+from trm_llm.utils.logger import log, log_warning
+from trm_llm.models.transformer_blocks import TransformerEncoder, PositionalEncoding
+from trm_llm.models.reasoning_module import RecursiveReasoningModule
+from trm_llm.models.action_module import ActionStateModule
+from trm_llm.models.output_heads import OutputHeads, UnifiedGenerationHead
+from trm_llm.models.pretrained_loader import load_pretrained_weights, freeze_module, count_parameters
 
 
 class TRMLLM(nn.Module):
@@ -30,6 +34,11 @@ class TRMLLM(nn.Module):
 
     Architecture:
         Input → Encoder → [Recursive Reasoning → Action Update] × T → Outputs
+
+    Generation:
+        - direct_answer: generates answer text
+        - tool_call: generates JSON like {"name": "tool", "arguments": {...}}
+                     or [{"name": "tool1", ...}, {"name": "tool2", ...}] for parallel calls
     """
 
     def __init__(self, config: TRMLLMConfig):
@@ -51,7 +60,7 @@ class TRMLLM(nn.Module):
             num_layers=config.num_layers,
             num_heads=config.num_heads,
             ff_dim=config.ff_dim,
-            dropout=config.dropout
+            dropout=config.dropout,
         )
 
         # ===== TRM Components =====
@@ -60,41 +69,29 @@ class TRMLLM(nn.Module):
             hidden_dim=config.hidden_dim,
             reasoning_dim=config.reasoning_dim,
             action_dim=config.action_dim,
-            num_recursions=config.num_recursions
+            num_recursions=config.num_recursions,
         )
 
         # Action state module
         self.action_module = ActionStateModule(
-            reasoning_dim=config.reasoning_dim,
-            action_dim=config.action_dim
+            reasoning_dim=config.reasoning_dim, action_dim=config.action_dim
         )
 
-        # Output heads
+        # Output heads (action type + num parallel calls + halt)
         self.output_heads = OutputHeads(
             action_dim=config.action_dim,
             num_action_types=config.num_action_types,
-            max_tools=config.max_tools,
-            max_parallel_calls=config.max_parallel_calls
+            max_parallel_calls=config.max_parallel_calls,
         )
 
-        # Parameter generation head (for tool arguments)
-        self.param_head = ParameterGenerationHead(
+        # Unified generation head (for both tool calls and direct answers)
+        self.generation_head = UnifiedGenerationHead(
             action_dim=config.action_dim,
             vocab_size=config.vocab_size,
-            hidden_dim=config.action_dim,  # Use same dim for simplicity
-            num_layers=2,
-            num_heads=4,
-            max_param_len=config.max_param_len
-        )
-
-        # Response generation head (for direct answer text)
-        self.response_head = ResponseGenerationHead(
-            action_dim=config.action_dim,
-            vocab_size=config.vocab_size,
-            hidden_dim=getattr(config, 'response_hidden_dim', 384),
-            num_layers=getattr(config, 'response_num_layers', 3),
-            num_heads=getattr(config, 'response_num_heads', 6),
-            max_response_len=config.max_response_len
+            hidden_dim=getattr(config, "generation_hidden_dim", 384),
+            num_layers=getattr(config, "generation_num_layers", 3),
+            num_heads=getattr(config, "generation_num_heads", 6),
+            max_gen_len=config.max_generation_len,
         )
 
         # ===== Learnable Initial State =====
@@ -125,7 +122,11 @@ class TRMLLM(nn.Module):
         batch_size, seq_len = input_ids.shape
 
         # Token embeddings
-        token_embeds = self.token_embedding(input_ids)  # (batch_size, seq_len, hidden_dim)
+        token_embeds = self.token_embedding(input_ids)  # (batch_size, seq_len, embed_dim)
+
+        # Project if using pretrained embeddings with different hidden dim
+        if hasattr(self, "embed_proj") and self.embed_proj is not None:
+            token_embeds = self.embed_proj(token_embeds)  # (batch_size, seq_len, hidden_dim)
 
         # Position embeddings
         positions = torch.arange(seq_len, device=input_ids.device).unsqueeze(0)
@@ -145,8 +146,7 @@ class TRMLLM(nn.Module):
         input_ids: torch.Tensor,
         max_supervision_steps: Optional[int] = None,
         training: bool = True,
-        target_param_ids: Optional[torch.Tensor] = None,
-        target_response_ids: Optional[torch.Tensor] = None
+        target_generation_ids: Optional[torch.Tensor] = None,
     ) -> List[Dict[str, torch.Tensor]]:
         """Forward pass with deep supervision
 
@@ -162,18 +162,18 @@ class TRMLLM(nn.Module):
             input_ids: (batch_size, seq_len) - input token IDs
             max_supervision_steps: number of supervision iterations (default: config value)
             training: whether in training mode (affects ACT behavior)
-            target_param_ids: (batch_size, param_seq_len) - target parameter token IDs for training
-            target_response_ids: (batch_size, response_seq_len) - target response token IDs for training
+            target_generation_ids: (batch_size, gen_seq_len) - target token IDs for generation
+                For tool_call: JSON like {"name": "tool", "arguments": {...}}
+                For direct_answer: answer text
 
         Returns:
             outputs_per_step: List of dicts, one per supervision step
                 Each dict contains:
                     - action_logits: (batch_size, num_action_types)
-                    - tool_logits: (batch_size, max_tools)
+                    - num_calls_logits: (batch_size, max_parallel_calls)
                     - halt_logit: (batch_size, 1)
                     - y_state: (batch_size, action_dim)
-                    - param_logits: (batch_size, param_seq_len, vocab_size) if target_param_ids provided
-                    - response_logits: (batch_size, response_seq_len, vocab_size) if target_response_ids provided
+                    - generation_logits: (batch_size, gen_seq_len, vocab_size) if target provided
         """
         batch_size = input_ids.size(0)
         max_steps = max_supervision_steps or self.config.max_supervision_steps
@@ -197,37 +197,32 @@ class TRMLLM(nn.Module):
                 x_encoded=x_encoded,
                 y_current=y,
                 z_current=z,
-                n_recursions=self.config.num_recursions
+                n_recursions=self.config.num_recursions,
             )  # (batch_size, reasoning_dim)
 
             # 3b. Update action state: y = g(y, z)
             y = self.action_module(y_current=y, z_reasoning=z)  # (batch_size, action_dim)
 
             # 3c. Generate outputs from current y
-            outputs = self.output_heads(y)  # Dict with action_logits, tool_logits, halt_logit
+            outputs = self.output_heads(y)  # Dict with action_logits, num_calls_logits, halt_logit
 
-            # 3d. Generate parameter/response logits if target provided (only on last step for efficiency)
-            if step == max_steps - 1:
-                if target_param_ids is not None:
-                    param_logits = self.param_head(y, target_ids=target_param_ids)
-                    outputs['param_logits'] = param_logits
-                if target_response_ids is not None:
-                    response_logits = self.response_head(y, target_ids=target_response_ids)
-                    outputs['response_logits'] = response_logits
+            # 3d. Generate logits if target provided (only on last step for efficiency)
+            if step == max_steps - 1 and target_generation_ids is not None:
+                generation_logits = self.generation_head(y, target_ids=target_generation_ids)
+                outputs["generation_logits"] = generation_logits
 
             outputs_per_step.append(outputs)
 
             # 3e. Check for early stopping (ACT) - only in inference
             if not training:
-                halt_prob = torch.sigmoid(outputs['halt_logit']).mean().item()
+                halt_prob = torch.sigmoid(outputs["halt_logit"]).mean().item()
                 if halt_prob > self.config.halt_threshold:
-                    # Generate params/response on early stop too
-                    if target_param_ids is not None and 'param_logits' not in outputs:
-                        param_logits = self.param_head(y, target_ids=target_param_ids)
-                        outputs['param_logits'] = param_logits
-                    if target_response_ids is not None and 'response_logits' not in outputs:
-                        response_logits = self.response_head(y, target_ids=target_response_ids)
-                        outputs['response_logits'] = response_logits
+                    # Generate on early stop too
+                    if target_generation_ids is not None and "generation_logits" not in outputs:
+                        generation_logits = self.generation_head(
+                            y, target_ids=target_generation_ids
+                        )
+                        outputs["generation_logits"] = generation_logits
                     break
 
             # 3f. Detach states for next iteration
@@ -239,33 +234,27 @@ class TRMLLM(nn.Module):
 
         return outputs_per_step
 
-    def generate_params(self, y_state: torch.Tensor, max_length: int = 64) -> torch.Tensor:
-        """Generate parameter tokens from action state
+    def generate(
+        self,
+        y_state: torch.Tensor,
+        max_length: int = 256,
+        temperature: float = 1.0,
+        eos_token_id: int = None,
+    ) -> torch.Tensor:
+        """Generate tokens from action state
 
         Args:
             y_state: (batch_size, action_dim) - final action state
-            max_length: maximum parameter sequence length
-
-        Returns:
-            param_ids: (batch_size, seq_len) - generated parameter token IDs
-        """
-        return self.param_head.generate(y_state, max_length=max_length)
-
-    def generate_response(self, y_state: torch.Tensor, max_length: int = 128,
-                          temperature: float = 1.0, eos_token_id: int = None) -> torch.Tensor:
-        """Generate response tokens from action state
-
-        Args:
-            y_state: (batch_size, action_dim) - final action state
-            max_length: maximum response sequence length
+            max_length: maximum generation length
             temperature: sampling temperature (1.0 = greedy)
             eos_token_id: token ID to stop generation
 
         Returns:
-            response_ids: (batch_size, seq_len) - generated response token IDs
+            generated_ids: (batch_size, seq_len) - generated token IDs
         """
-        return self.response_head.generate(y_state, max_length=max_length,
-                                           temperature=temperature, eos_token_id=eos_token_id)
+        return self.generation_head.generate(
+            y_state, max_length=max_length, temperature=temperature, eos_token_id=eos_token_id
+        )
 
     def get_num_params(self):
         """Count total number of parameters"""
@@ -274,6 +263,187 @@ class TRMLLM(nn.Module):
     def get_num_trainable_params(self):
         """Count trainable parameters"""
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
+
+    def load_pretrained_embeddings(
+        self,
+        model_name_or_path: str,
+        freeze: bool = True,
+        device: str = "cpu",
+        tokenizer_vocab_size: Optional[int] = None,
+    ):
+        """Load pretrained token embeddings and LM head from a causal LM
+
+        This replaces:
+        - self.token_embedding with pretrained embeddings
+        - self.generation_head.token_embedding with pretrained embeddings
+        - self.generation_head.output_proj with pretrained LM head
+
+        Args:
+            model_name_or_path: HuggingFace model name (e.g., "Qwen/Qwen2.5-3B")
+            freeze: Whether to freeze the pretrained weights
+            device: Device to load weights to
+            tokenizer_vocab_size: Vocab size from tokenizer (may include added special tokens)
+        """
+        log("Loading pretrained weights", model=model_name_or_path, freeze=freeze)
+
+        # Load pretrained weights (pass tokenizer vocab size to handle special tokens)
+        pretrained_embed, pretrained_lm_head, vocab_size, hidden_dim = load_pretrained_weights(
+            model_name_or_path, device=device, new_vocab_size=tokenizer_vocab_size
+        )
+
+        # Check dimension compatibility
+        if hidden_dim != self.config.hidden_dim:
+            log_warning("Hidden dim mismatch - adding projection layers",
+                pretrained=hidden_dim, config=self.config.hidden_dim)
+
+            # Add projection from pretrained hidden_dim to config hidden_dim
+            self.embed_proj = nn.Linear(hidden_dim, self.config.hidden_dim).to(device)
+            self._pretrained_hidden_dim = hidden_dim
+        else:
+            self.embed_proj = None
+            self._pretrained_hidden_dim = hidden_dim
+
+        # Replace token embedding (for encoder input)
+        self.token_embedding = pretrained_embed
+
+        # Update generation head to use pretrained embeddings and LM head
+        # Need to handle dimension mismatch for generation head too
+        gen_hidden_dim = getattr(self.config, "generation_hidden_dim", 384)
+
+        # Replace generation head token embedding
+        self.generation_head.token_embedding = nn.Embedding(vocab_size, gen_hidden_dim).to(device)
+        # Project from pretrained embedding to generation hidden dim if needed
+        if hidden_dim != gen_hidden_dim:
+            self.generation_head._pretrained_embed = pretrained_embed
+            self.generation_head._embed_proj = nn.Linear(hidden_dim, gen_hidden_dim).to(device)
+            # Override forward to use projection
+            original_forward = self.generation_head.forward
+
+            def new_forward(y_state, target_ids=None, max_length=None):
+                if target_ids is not None:
+                    # Project pretrained embeddings
+                    pretrained_embeds = self.generation_head._pretrained_embed(target_ids)
+                    projected_embeds = self.generation_head._embed_proj(pretrained_embeds)
+                    # Add position embeddings
+                    seq_len = target_ids.size(1)
+                    positions = torch.arange(seq_len, device=target_ids.device).unsqueeze(0)
+                    tgt = projected_embeds + self.generation_head.position_embedding(positions)
+                    # Continue with decoder
+                    memory = self.generation_head.context_proj(y_state).unsqueeze(1)
+                    causal_mask = self.generation_head._get_causal_mask(seq_len, target_ids.device)
+                    output = self.generation_head.decoder(tgt, memory, tgt_mask=causal_mask)
+                    logits = self.generation_head.output_proj(output)
+                    return logits
+                else:
+                    return original_forward(y_state, target_ids, max_length)
+
+            self.generation_head.forward = new_forward
+        else:
+            self.generation_head.token_embedding = pretrained_embed
+
+        # Replace LM head (output projection)
+        # Need projection if generation hidden dim != pretrained hidden dim
+        if gen_hidden_dim != hidden_dim:
+            self.generation_head._lm_head_proj = nn.Linear(gen_hidden_dim, hidden_dim).to(device)
+            self.generation_head._pretrained_lm_head = pretrained_lm_head
+
+            # Create new output_proj that projects then uses pretrained LM head
+            class ProjectedLMHead(nn.Module):
+                def __init__(self, proj, lm_head):
+                    super().__init__()
+                    self.proj = proj
+                    self.lm_head = lm_head
+
+                def forward(self, x):
+                    return self.lm_head(self.proj(x))
+
+            self.generation_head.output_proj = ProjectedLMHead(
+                self.generation_head._lm_head_proj, pretrained_lm_head
+            ).to(device)
+        else:
+            self.generation_head.output_proj = pretrained_lm_head
+
+        # Update vocab size
+        self.config.vocab_size = vocab_size
+
+        # Freeze pretrained weights if requested
+        if freeze:
+            self.freeze_pretrained()
+
+        # Print parameter counts
+        param_counts = count_parameters(self)
+        log("Parameter counts after loading pretrained",
+            total=f"{param_counts['total_M']:.1f}M",
+            trainable=f"{param_counts['trainable_M']:.1f}M",
+            frozen=f"{param_counts['frozen_M']:.1f}M")
+
+        return vocab_size, hidden_dim
+
+    def freeze_pretrained(self):
+        """Freeze pretrained components (embeddings and LM head)"""
+        # Freeze token embedding
+        freeze_module(self.token_embedding)
+
+        # Freeze generation head embeddings and LM head
+        if hasattr(self.generation_head, "_pretrained_embed"):
+            freeze_module(self.generation_head._pretrained_embed)
+        if hasattr(self.generation_head, "_pretrained_lm_head"):
+            freeze_module(self.generation_head._pretrained_lm_head)
+        elif hasattr(self.generation_head, "output_proj"):
+            # If output_proj is the pretrained LM head directly
+            if isinstance(self.generation_head.output_proj, nn.Linear):
+                freeze_module(self.generation_head.output_proj)
+            elif hasattr(self.generation_head.output_proj, "lm_head"):
+                freeze_module(self.generation_head.output_proj.lm_head)
+
+        log("Pretrained weights frozen")
+
+    def unfreeze_pretrained(self):
+        """Unfreeze pretrained components for fine-tuning"""
+        from trm_llm.models.pretrained_loader import unfreeze_module
+
+        # Unfreeze token embedding
+        unfreeze_module(self.token_embedding)
+
+        # Unfreeze generation head components
+        if hasattr(self.generation_head, "_pretrained_embed"):
+            unfreeze_module(self.generation_head._pretrained_embed)
+        if hasattr(self.generation_head, "_pretrained_lm_head"):
+            unfreeze_module(self.generation_head._pretrained_lm_head)
+        elif hasattr(self.generation_head, "output_proj"):
+            unfreeze_module(self.generation_head.output_proj)
+
+        log("Pretrained weights unfrozen")
+
+    def get_parameter_groups(self, pretrained_lr: float = 1e-5, trm_lr: float = 1e-4):
+        """Get parameter groups with different learning rates
+
+        Useful for fine-tuning where pretrained weights need lower LR.
+
+        Args:
+            pretrained_lr: Learning rate for pretrained components
+            trm_lr: Learning rate for TRM-specific components
+
+        Returns:
+            List of parameter groups for optimizer
+        """
+        pretrained_params = []
+        trm_params = []
+
+        # Categorize parameters
+        for name, param in self.named_parameters():
+            if not param.requires_grad:
+                continue
+
+            if "token_embedding" in name or "output_proj" in name or "_pretrained" in name:
+                pretrained_params.append(param)
+            else:
+                trm_params.append(param)
+
+        return [
+            {"params": pretrained_params, "lr": pretrained_lr},
+            {"params": trm_params, "lr": trm_lr},
+        ]
 
 
 class TRMLLMWithCache(TRMLLM):
@@ -290,7 +460,7 @@ class TRMLLMWithCache(TRMLLM):
         self,
         input_ids: torch.Tensor,
         use_cache: bool = True,
-        max_supervision_steps: Optional[int] = None
+        max_supervision_steps: Optional[int] = None,
     ):
         """Forward with encoder caching
 
@@ -326,7 +496,7 @@ class TRMLLMWithCache(TRMLLM):
             outputs_per_step.append(outputs)
 
             # ACT early stopping
-            halt_prob = torch.sigmoid(outputs['halt_logit']).mean().item()
+            halt_prob = torch.sigmoid(outputs["halt_logit"]).mean().item()
             if halt_prob > self.config.halt_threshold:
                 break
 

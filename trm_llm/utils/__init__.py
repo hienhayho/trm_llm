@@ -1,5 +1,5 @@
 """Utility functions for TRM-LLM"""
 
-from .config import TRMLLMConfig
+from trm_llm.utils.config import TRMLLMConfig
 
 __all__ = ['TRMLLMConfig']

@@ -221,3 +221,5 @@ data/**/*.jsonl
 
 full_conversation_*
 format_*
+
+model_cache

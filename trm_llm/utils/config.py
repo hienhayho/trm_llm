@@ -37,9 +37,8 @@ class TRMLLMConfig:
     max_tools: int = 50  # Maximum number of tools in context
     max_parallel_calls: int = 5  # Maximum number of parallel tool calls
 
-    # Generation heads
-    max_param_len: int = 128  # Maximum parameter sequence length
-    max_response_len: int = 512  # Maximum response sequence length
+    # Unified generation head (generates either tool call JSON or direct answer)
+    max_generation_len: int = 512  # Maximum generation sequence length
 
     # ===== Training Hyperparameters =====
     learning_rate: float = 1e-4
@@ -52,6 +51,13 @@ class TRMLLMConfig:
     # ===== Adaptive Computation Time (ACT) =====
     halt_threshold: float = 0.5  # Threshold for early stopping
     halt_loss_weight: float = 0.5  # Weight for halting loss
+
+    # ===== Loss Weights =====
+    action_loss_weight: float = 2.0  # Weight for action classification loss (tool_call vs direct_answer)
+    tool_call_gen_weight: float = 2.0  # Weight for tool call JSON generation loss (higher = focus more on tool calls)
+    direct_answer_gen_weight: float = 1.0  # Weight for direct answer generation loss
+    special_token_weight: float = 5.0  # Extra weight for special tokens like <tool_call>, </tool_call> (improves structure)
+    label_smoothing: float = 0.1  # Label smoothing for generation loss (0.0 = no smoothing, 0.1 = recommended)
 
     # ===== Data Processing =====
     pad_token_id: int = 50256  # GPT-2 pad token
@@ -94,11 +100,11 @@ class TRMLLMConfig:
         # Action module (2 layers, action_dim)
         action = 2 * (4 * self.action_dim**2 + 2 * self.action_dim * (self.action_dim * 4))
 
-        # Output heads
+        # Output heads (action, num_calls, halt - no tool_head since tool selection is via generation)
         action_head = self.action_dim * self.num_action_types
-        tool_head = self.action_dim * self.max_tools
+        num_calls_head = self.action_dim * self.max_parallel_calls
         halt_head = self.action_dim * 1
-        output_heads = action_head + tool_head + halt_head
+        output_heads = action_head + num_calls_head + halt_head
 
         total = token_embed + pos_embed + encoder_total + reasoning + action + output_heads
 

@@ -8,8 +8,8 @@ import torch.nn.functional as F
 from typing import Dict, List, Optional
 import json
 
-from ..utils.config import TRMLLMConfig
-from ..data.tokenizer import ToolCallTokenizer
+from trm_llm.utils.config import TRMLLMConfig
+from trm_llm.data.tokenizer import ToolCallTokenizer
 
 
 class TRMInference:

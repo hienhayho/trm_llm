@@ -9,6 +9,9 @@ dependencies = [
     "transformers>=4.30.0",
     "numpy>=1.24.0",
     "tqdm>=4.65.0",
+    "accelerate>=1.0.1",
+    "muon-optimizer",
+    "structlog>=25.5.0",
 ]
 
 [project.optional-dependencies]
@@ -29,3 +32,6 @@ target-version = ['py38']
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 python_files = "test_*.py"
+
+[tool.uv.sources]
+muon-optimizer = { git = "https://github.com/KellerJordan/Muon" }

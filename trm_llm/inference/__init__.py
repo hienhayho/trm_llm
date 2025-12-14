@@ -1,5 +1,5 @@
 """Inference components for TRM-LLM"""
 
-from .generator import TRMInference
+from trm_llm.inference.generator import TRMInference
 
 __all__ = ['TRMInference']

@@ -25,38 +25,31 @@ class DataCollator:
                 - input_ids: List[int]
                 - target_action: int
                 - target_tool_id: int
-                - target_param_ids: List[int] (may be empty)
-                - target_response_ids: List[int] (may be empty)
+                - target_num_calls: int
+                - target_generation_ids: List[int] (may be empty)
 
         Returns:
             batched: Dict with:
                 - input_ids: (batch_size, max_len)
                 - target_action: (batch_size,)
                 - target_tool_id: (batch_size,)
+                - target_num_calls: (batch_size,)
                 - attention_mask: (batch_size, max_len)
-                - target_param_ids: (batch_size, max_param_len)
-                - param_mask: (batch_size, max_param_len)
-                - target_response_ids: (batch_size, max_response_len)
-                - response_mask: (batch_size, max_response_len)
+                - target_generation_ids: (batch_size, max_gen_len)
+                - generation_mask: (batch_size, max_gen_len)
         """
         # Find max length in batch
         max_len = max(len(item['input_ids']) for item in batch)
 
-        # Find max param length (only for items with tool calls)
-        param_lengths = [len(item.get('target_param_ids', [])) for item in batch]
-        max_param_len = max(param_lengths) if any(param_lengths) else 1  # At least 1 for tensor shape
-
-        # Find max response length (only for direct_answer samples)
-        response_lengths = [len(item.get('target_response_ids', [])) for item in batch]
-        max_response_len = max(response_lengths) if any(response_lengths) else 1  # At least 1 for tensor shape
+        # Find max generation length
+        gen_lengths = [len(item.get('target_generation_ids', [])) for item in batch]
+        max_gen_len = max(gen_lengths) if any(gen_lengths) else 1  # At least 1 for tensor shape
 
         # Pad sequences
         input_ids = []
         attention_masks = []
-        target_param_ids = []
-        param_masks = []
-        target_response_ids = []
-        response_masks = []
+        target_generation_ids = []
+        generation_masks = []
 
         for item in batch:
             ids = item['input_ids']
@@ -72,25 +65,15 @@ class DataCollator:
             input_ids.append(padded_ids)
             attention_masks.append(attention_mask)
 
-            # Padding for param ids
-            param_ids = item.get('target_param_ids', [])
-            param_len = len(param_ids)
-            param_padding_len = max_param_len - param_len
-            padded_param_ids = param_ids + [self.pad_token_id] * param_padding_len
-            param_mask = [1] * param_len + [0] * param_padding_len
+            # Padding for generation ids
+            gen_ids = item.get('target_generation_ids', [])
+            gen_len = len(gen_ids)
+            gen_padding_len = max_gen_len - gen_len
+            padded_gen_ids = gen_ids + [self.pad_token_id] * gen_padding_len
+            gen_mask = [1] * gen_len + [0] * gen_padding_len
 
-            target_param_ids.append(padded_param_ids)
-            param_masks.append(param_mask)
-
-            # Padding for response ids
-            response_ids = item.get('target_response_ids', [])
-            response_len = len(response_ids)
-            response_padding_len = max_response_len - response_len
-            padded_response_ids = response_ids + [self.pad_token_id] * response_padding_len
-            response_mask = [1] * response_len + [0] * response_padding_len
-
-            target_response_ids.append(padded_response_ids)
-            response_masks.append(response_mask)
+            target_generation_ids.append(padded_gen_ids)
+            generation_masks.append(gen_mask)
 
         # Convert to tensors
         batched = {
@@ -99,10 +82,8 @@ class DataCollator:
             'target_action': torch.tensor([item['target_action'] for item in batch], dtype=torch.long),
             'target_tool_id': torch.tensor([item['target_tool_id'] for item in batch], dtype=torch.long),
             'target_num_calls': torch.tensor([item.get('target_num_calls', 0) for item in batch], dtype=torch.long),
-            'target_param_ids': torch.tensor(target_param_ids, dtype=torch.long),
-            'param_mask': torch.tensor(param_masks, dtype=torch.long),
-            'target_response_ids': torch.tensor(target_response_ids, dtype=torch.long),
-            'response_mask': torch.tensor(response_masks, dtype=torch.long),
+            'target_generation_ids': torch.tensor(target_generation_ids, dtype=torch.long),
+            'generation_mask': torch.tensor(generation_masks, dtype=torch.long),
         }
 
         return batched

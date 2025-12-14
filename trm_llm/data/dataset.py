@@ -7,7 +7,8 @@ Splits each conversation into multiple decision-point samples.
 import json
 from torch.utils.data import Dataset
 from typing import Dict, List, Optional, Tuple
-from .tokenizer import ToolCallTokenizer
+from trm_llm.data.tokenizer import ToolCallTokenizer
+from trm_llm.utils.logger import log
 
 
 class ToolCallDataset(Dataset):
@@ -34,8 +35,7 @@ class ToolCallDataset(Dataset):
         jsonl_path: str,
         tokenizer: ToolCallTokenizer,
         max_length: int = 2048,
-        max_param_len: int = 128,
-        max_response_len: int = 256,
+        max_generation_len: int = 512,
         compute_stats: bool = True
     ):
         """
@@ -43,14 +43,12 @@ class ToolCallDataset(Dataset):
             jsonl_path: Path to JSONL file
             tokenizer: ToolCallTokenizer instance
             max_length: Maximum input sequence length
-            max_param_len: Maximum parameter sequence length
-            max_response_len: Maximum response sequence length
+            max_generation_len: Maximum generation sequence length (for both tool call JSON and direct answers)
             compute_stats: Whether to compute dataset statistics (can be slow)
         """
         self.tokenizer = tokenizer
         self.max_length = max_length
-        self.max_param_len = max_param_len
-        self.max_response_len = max_response_len
+        self.max_generation_len = max_generation_len
 
         # Load raw data
         self.raw_data = []
@@ -176,9 +174,16 @@ class ToolCallDataset(Dataset):
 
                         # Create tool_call sample
                         # Input: context up to (not including) tool_calls
-                        # Target: tool_call action, first tool, num parallel calls
+                        # Target: tool_call action, num parallel calls, generation content
                         first_tool_call = tool_calls[0]
                         tool_name = self.tokenizer.get_tool_name_from_call(first_tool_call["content"])
+
+                        # Generation target is the tool call JSON (single or array for parallel calls)
+                        if len(tool_calls) == 1:
+                            generation_content = first_tool_call["content"]
+                        else:
+                            # Multiple parallel calls - generate as JSON array
+                            generation_content = "[" + ", ".join(tc["content"] for tc in tool_calls) + "]"
 
                         sample = {
                             "tools_json": tools_json,
@@ -186,8 +191,7 @@ class ToolCallDataset(Dataset):
                             "target_action": 1,  # tool_call
                             "target_tool_id": self.get_tool_id(tool_name) if tool_name else -1,
                             "target_num_calls": len(tool_calls),  # Number of parallel calls
-                            "target_param_content": first_tool_call["content"],
-                            "target_response_content": None,  # No response for tool_call
+                            "target_generation_content": generation_content,  # Tool call JSON
                             "raw_idx": raw_idx,
                         }
                         samples.append(sample)
@@ -208,8 +212,7 @@ class ToolCallDataset(Dataset):
                             "target_action": 0,  # direct_answer
                             "target_tool_id": -1,
                             "target_num_calls": 0,
-                            "target_param_content": None,
-                            "target_response_content": next_msg["content"],  # Target response text
+                            "target_generation_content": next_msg["content"],  # Direct answer text
                             "raw_idx": raw_idx,
                         }
                         samples.append(sample)
@@ -238,8 +241,7 @@ class ToolCallDataset(Dataset):
                         "target_action": 0,  # direct_answer
                         "target_tool_id": -1,
                         "target_num_calls": 0,
-                        "target_param_content": None,
-                        "target_response_content": msg["content"],  # Target response text
+                        "target_generation_content": msg["content"],  # Direct answer text
                         "raw_idx": raw_idx,
                     }
                     samples.append(sample)
@@ -270,8 +272,7 @@ class ToolCallDataset(Dataset):
 
         # Compute character-level length stats (fast)
         context_char_lengths = []
-        param_char_lengths = []
-        response_char_lengths = []
+        generation_char_lengths = []
 
         for s in self.samples:
             # Context length (sum of all message contents)
@@ -279,13 +280,9 @@ class ToolCallDataset(Dataset):
             ctx_len += len(s["tools_json"])  # Add tools
             context_char_lengths.append(ctx_len)
 
-            # Param length (for tool_call)
-            if s.get("target_param_content"):
-                param_char_lengths.append(len(s["target_param_content"]))
-
-            # Response length (for direct_answer)
-            if s.get("target_response_content"):
-                response_char_lengths.append(len(s["target_response_content"]))
+            # Generation length (tool call JSON or direct answer)
+            if s.get("target_generation_content"):
+                generation_char_lengths.append(len(s["target_generation_content"]))
 
         # Compute token-level length stats (tokenize all samples)
         # We compute both original (untruncated) and truncated lengths
@@ -293,15 +290,11 @@ class ToolCallDataset(Dataset):
         input_token_lengths_orig = []
         input_truncated_count = 0
 
-        param_token_lengths = []
-        param_token_lengths_orig = []
-        param_truncated_count = 0
+        generation_token_lengths = []
+        generation_token_lengths_orig = []
+        generation_truncated_count = 0
 
-        response_token_lengths = []
-        response_token_lengths_orig = []
-        response_truncated_count = 0
-
-        print("  Computing token statistics...")
+        log("  Computing token statistics...")
         for idx in tqdm(range(len(self.samples)), desc="  Tokenizing samples", leave=False):
             sample = self.samples[idx]
 
@@ -324,39 +317,32 @@ class ToolCallDataset(Dataset):
             if len(input_ids_orig) > self.max_length:
                 input_truncated_count += 1
 
-            # Param tokens
-            if sample.get("target_param_content"):
-                param_ids = self.tokenizer.encode_text(
-                    sample["target_param_content"],
-                    truncation=True,
-                    max_length=self.max_param_len
-                )
-                param_token_lengths.append(len(param_ids))
-
-                param_ids_orig = self.tokenizer.encode_text(
-                    sample["target_param_content"],
-                    truncation=False
-                )
-                param_token_lengths_orig.append(len(param_ids_orig))
-                if len(param_ids_orig) > self.max_param_len:
-                    param_truncated_count += 1
-
-            # Response tokens
-            if sample.get("target_response_content"):
-                response_ids = self.tokenizer.encode_text(
-                    sample["target_response_content"],
-                    truncation=True,
-                    max_length=self.max_response_len
-                )
-                response_token_lengths.append(len(response_ids))
-
-                response_ids_orig = self.tokenizer.encode_text(
-                    sample["target_response_content"],
-                    truncation=False
-                )
-                response_token_lengths_orig.append(len(response_ids_orig))
-                if len(response_ids_orig) > self.max_response_len:
-                    response_truncated_count += 1
+            # Generation tokens (tool call JSON with tags, or direct answer)
+            if sample.get("target_generation_content"):
+                if sample["target_action"] == 1:  # tool_call
+                    gen_ids = self.tokenizer.encode_tool_call(
+                        sample["target_generation_content"],
+                        truncation=True,
+                        max_length=self.max_generation_len
+                    )
+                    gen_ids_orig = self.tokenizer.encode_tool_call(
+                        sample["target_generation_content"],
+                        truncation=False
+                    )
+                else:  # direct_answer
+                    gen_ids = self.tokenizer.encode_text(
+                        sample["target_generation_content"],
+                        truncation=True,
+                        max_length=self.max_generation_len
+                    )
+                    gen_ids_orig = self.tokenizer.encode_text(
+                        sample["target_generation_content"],
+                        truncation=False
+                    )
+                generation_token_lengths.append(len(gen_ids))
+                generation_token_lengths_orig.append(len(gen_ids_orig))
+                if len(gen_ids_orig) > self.max_generation_len:
+                    generation_truncated_count += 1
 
         # Unique tools
         num_unique_tools = len(self.tool_name_to_id)
@@ -374,17 +360,11 @@ class ToolCallDataset(Dataset):
                 "max": max(context_char_lengths) if context_char_lengths else 0,
                 "avg": sum(context_char_lengths) / len(context_char_lengths) if context_char_lengths else 0,
             },
-            "param_char_lengths": {
-                "min": min(param_char_lengths) if param_char_lengths else 0,
-                "max": max(param_char_lengths) if param_char_lengths else 0,
-                "avg": sum(param_char_lengths) / len(param_char_lengths) if param_char_lengths else 0,
-                "count": len(param_char_lengths),
-            },
-            "response_char_lengths": {
-                "min": min(response_char_lengths) if response_char_lengths else 0,
-                "max": max(response_char_lengths) if response_char_lengths else 0,
-                "avg": sum(response_char_lengths) / len(response_char_lengths) if response_char_lengths else 0,
-                "count": len(response_char_lengths),
+            "generation_char_lengths": {
+                "min": min(generation_char_lengths) if generation_char_lengths else 0,
+                "max": max(generation_char_lengths) if generation_char_lengths else 0,
+                "avg": sum(generation_char_lengths) / len(generation_char_lengths) if generation_char_lengths else 0,
+                "count": len(generation_char_lengths),
             },
             # Token-level stats (truncated - what's used in training)
             "input_token_lengths": {
@@ -395,21 +375,13 @@ class ToolCallDataset(Dataset):
                 "truncated_count": input_truncated_count,
                 "max_length": self.max_length,
             },
-            "param_token_lengths": {
-                "min": min(param_token_lengths) if param_token_lengths else 0,
-                "max": max(param_token_lengths) if param_token_lengths else 0,
-                "avg": sum(param_token_lengths) / len(param_token_lengths) if param_token_lengths else 0,
-                "count": len(param_token_lengths),
-                "truncated_count": param_truncated_count,
-                "max_length": self.max_param_len,
-            },
-            "response_token_lengths": {
-                "min": min(response_token_lengths) if response_token_lengths else 0,
-                "max": max(response_token_lengths) if response_token_lengths else 0,
-                "avg": sum(response_token_lengths) / len(response_token_lengths) if response_token_lengths else 0,
-                "count": len(response_token_lengths),
-                "truncated_count": response_truncated_count,
-                "max_length": self.max_response_len,
+            "generation_token_lengths": {
+                "min": min(generation_token_lengths) if generation_token_lengths else 0,
+                "max": max(generation_token_lengths) if generation_token_lengths else 0,
+                "avg": sum(generation_token_lengths) / len(generation_token_lengths) if generation_token_lengths else 0,
+                "count": len(generation_token_lengths),
+                "truncated_count": generation_truncated_count,
+                "max_length": self.max_generation_len,
             },
             # Token-level stats (original - before truncation)
             "input_token_lengths_orig": {
@@ -417,15 +389,10 @@ class ToolCallDataset(Dataset):
                 "max": max(input_token_lengths_orig) if input_token_lengths_orig else 0,
                 "avg": sum(input_token_lengths_orig) / len(input_token_lengths_orig) if input_token_lengths_orig else 0,
             },
-            "param_token_lengths_orig": {
-                "min": min(param_token_lengths_orig) if param_token_lengths_orig else 0,
-                "max": max(param_token_lengths_orig) if param_token_lengths_orig else 0,
-                "avg": sum(param_token_lengths_orig) / len(param_token_lengths_orig) if param_token_lengths_orig else 0,
-            },
-            "response_token_lengths_orig": {
-                "min": min(response_token_lengths_orig) if response_token_lengths_orig else 0,
-                "max": max(response_token_lengths_orig) if response_token_lengths_orig else 0,
-                "avg": sum(response_token_lengths_orig) / len(response_token_lengths_orig) if response_token_lengths_orig else 0,
+            "generation_token_lengths_orig": {
+                "min": min(generation_token_lengths_orig) if generation_token_lengths_orig else 0,
+                "max": max(generation_token_lengths_orig) if generation_token_lengths_orig else 0,
+                "avg": sum(generation_token_lengths_orig) / len(generation_token_lengths_orig) if generation_token_lengths_orig else 0,
             },
         }
 
@@ -448,16 +415,13 @@ class ToolCallDataset(Dataset):
             indices = random.sample(indices, sample_size)
 
         input_lengths = []
-        param_lengths = []
-        response_lengths = []
+        generation_lengths = []
 
         for idx in indices:
             item = self[idx]
             input_lengths.append(len(item["input_ids"]))
-            if item.get("target_param_ids"):
-                param_lengths.append(len(item["target_param_ids"]))
-            if item.get("target_response_ids"):
-                response_lengths.append(len(item["target_response_ids"]))
+            if item.get("target_generation_ids"):
+                generation_lengths.append(len(item["target_generation_ids"]))
 
         return {
             "sample_size": len(indices),
@@ -466,17 +430,11 @@ class ToolCallDataset(Dataset):
                 "max": max(input_lengths) if input_lengths else 0,
                 "avg": sum(input_lengths) / len(input_lengths) if input_lengths else 0,
             },
-            "param_token_lengths": {
-                "min": min(param_lengths) if param_lengths else 0,
-                "max": max(param_lengths) if param_lengths else 0,
-                "avg": sum(param_lengths) / len(param_lengths) if param_lengths else 0,
-                "count": len(param_lengths),
-            },
-            "response_token_lengths": {
-                "min": min(response_lengths) if response_lengths else 0,
-                "max": max(response_lengths) if response_lengths else 0,
-                "avg": sum(response_lengths) / len(response_lengths) if response_lengths else 0,
-                "count": len(response_lengths),
+            "generation_token_lengths": {
+                "min": min(generation_lengths) if generation_lengths else 0,
+                "max": max(generation_lengths) if generation_lengths else 0,
+                "avg": sum(generation_lengths) / len(generation_lengths) if generation_lengths else 0,
+                "count": len(generation_lengths),
             },
         }
 
@@ -492,7 +450,7 @@ class ToolCallDataset(Dataset):
 
         Returns:
             sample: Dict with input_ids, target_action, target_tool_id, target_num_calls,
-                    target_param_ids, target_response_ids
+                    target_generation_ids
         """
         sample = self.samples[idx]
 
@@ -504,31 +462,30 @@ class ToolCallDataset(Dataset):
             max_length=self.max_length
         )
 
-        # Tokenize tool call parameters if present
-        target_param_ids = []
-        if sample.get("target_param_content"):
-            target_param_ids = self.tokenizer.encode_text(
-                sample["target_param_content"],
-                truncation=True,
-                max_length=self.max_param_len
-            )
-
-        # Tokenize response content if present (for direct_answer samples)
-        target_response_ids = []
-        if sample.get("target_response_content"):
-            target_response_ids = self.tokenizer.encode_text(
-                sample["target_response_content"],
-                truncation=True,
-                max_length=self.max_response_len
-            )
+        # Tokenize generation content
+        # - For tool_call: use encode_tool_call (wraps in <tool_call>...</tool_call> tags)
+        # - For direct_answer: use encode_text (plain text)
+        target_generation_ids = []
+        if sample.get("target_generation_content"):
+            if sample["target_action"] == 1:  # tool_call
+                target_generation_ids = self.tokenizer.encode_tool_call(
+                    sample["target_generation_content"],
+                    truncation=True,
+                    max_length=self.max_generation_len
+                )
+            else:  # direct_answer
+                target_generation_ids = self.tokenizer.encode_text(
+                    sample["target_generation_content"],
+                    truncation=True,
+                    max_length=self.max_generation_len
+                )
 
         return {
             "input_ids": input_ids,
             "target_action": sample["target_action"],
             "target_tool_id": sample["target_tool_id"],
             "target_num_calls": sample["target_num_calls"],
-            "target_param_ids": target_param_ids,
-            "target_response_ids": target_response_ids,
+            "target_generation_ids": target_generation_ids,
         }
 
 

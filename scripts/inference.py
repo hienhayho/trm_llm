@@ -18,6 +18,7 @@ from trm_llm.models.trm_llm import TRMLLM
 from trm_llm.data.tokenizer import ToolCallTokenizer
 from trm_llm.inference.generator import TRMInference
 from trm_llm.utils.config import TRMLLMConfig
+from trm_llm.utils.logger import log, log_warning, log_error
 
 
 def parse_args():
@@ -62,48 +63,48 @@ def load_model(checkpoint_path, device, config_path=None):
         model: Loaded TRMLLM model
         config: TRMLLMConfig
     """
-    print(f"Loading checkpoint from {checkpoint_path}...")
+    log("Loading checkpoint", path=checkpoint_path)
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
 
     # Load config from JSON file if provided, otherwise from checkpoint
     config = None
 
     if config_path and os.path.exists(config_path):
-        print(f"Loading config from {config_path}...")
         with open(config_path, "r") as f:
             config_dict = json.load(f)
         config = TRMLLMConfig(**config_dict)
+        config_source = config_path
     else:
         # Try to find config.json in same dir as checkpoint
         checkpoint_dir = os.path.dirname(checkpoint_path)
         default_config_path = os.path.join(checkpoint_dir, "config.json")
         if os.path.exists(default_config_path):
-            print(f"Loading config from {default_config_path}...")
             with open(default_config_path, "r") as f:
                 config_dict = json.load(f)
             config = TRMLLMConfig(**config_dict)
+            config_source = default_config_path
         elif "config" in checkpoint:
-            print("Loading config from checkpoint...")
             config = checkpoint["config"]
+            config_source = "checkpoint"
         else:
             raise ValueError("No config found. Provide --config or ensure config.json exists.")
 
-    print(f"\nModel configuration:")
-    print(f"  Parameters: ~{config.estimate_parameters()['total_M']:.1f}M")
-    print(f"  Hidden dim: {config.hidden_dim}")
-    print(f"  Recursions: {config.num_recursions}")
-    print(f"  Max supervision steps: {config.max_supervision_steps}")
+    log("Model configuration",
+        config_source=config_source,
+        parameters=f"~{config.estimate_parameters()['total_M']:.1f}M",
+        hidden_dim=config.hidden_dim,
+        recursions=config.num_recursions,
+        max_supervision_steps=config.max_supervision_steps)
 
     model = TRMLLM(config)
     model.load_state_dict(checkpoint["model_state_dict"])
-    print(model)
+    log("Model loaded", architecture=str(model))
 
     metrics = checkpoint.get("metrics", {})
     if metrics:
-        print(f"\nCheckpoint metrics:")
-        for key, value in metrics.items():
-            if "accuracy" in key or "loss" in key:
-                print(f"  {key}: {value:.4f}")
+        metrics_info = {k: f"{v:.4f}" for k, v in metrics.items() if "accuracy" in k or "loss" in k}
+        if metrics_info:
+            log("Checkpoint metrics", **metrics_info)
 
     return model, config
 
@@ -150,13 +151,11 @@ def main():
         tool_mapping_path = os.path.join(checkpoint_dir, "tool_mapping.json")
 
     if os.path.exists(tool_mapping_path):
-        print(f"\nLoading tool mapping from {tool_mapping_path}...")
         with open(tool_mapping_path, "r") as f:
             tool_name_to_id = json.load(f)
-        print(f"Loaded {len(tool_name_to_id)} tools")
+        log("Tool mapping loaded", path=tool_mapping_path, num_tools=len(tool_name_to_id))
     else:
-        print(f"\nWarning: Tool mapping not found at {tool_mapping_path}")
-        print("Using empty mapping - tool names may not be resolved correctly")
+        log_warning("Tool mapping not found", path=tool_mapping_path, note="Using empty mapping")
         tool_name_to_id = {}
 
     # Initialize inference
@@ -168,32 +167,28 @@ def main():
         with open(args.tools, "r") as f:
             tools = json.load(f)
         tools_json = json.dumps(tools)
+        log("Tools loaded from file", path=args.tools, num_tools=len(tools))
     else:
         tools = default_tools()
         tools_json = json.dumps(tools)
-        print(f"\nUsing default tools:")
-        for tool in tools:
-            print(f"  - {tool['name']}: {tool['description']}")
+        tool_names = [t['name'] for t in tools]
+        log("Using default tools", tools=tool_names)
 
     # Interactive mode
     if args.interactive:
-        print("\n" + "=" * 80)
-        print("TRM-LLM Interactive Mode")
-        print("=" * 80)
-        print("Enter your queries (type 'quit' to exit, 'tools' to show tools)")
-        print("=" * 80)
+        log("TRM-LLM Interactive Mode", note="Enter queries (type 'quit' to exit, 'tools' to show tools)")
 
         while True:
             query = input("\nUser: ").strip()
 
             if query.lower() in ["quit", "exit", "q"]:
-                print("Goodbye!")
+                log("Goodbye!")
                 break
 
             if query.lower() == "tools":
-                print("\nAvailable tools:")
+                log("\nAvailable tools:")
                 for tool in tools:
-                    print(f"  - {tool['name']}: {tool['description']}")
+                    log(f"  - {tool['name']}: {tool['description']}")
                 continue
 
             if not query:
@@ -202,67 +197,72 @@ def main():
             # Generate
             if args.analyze:
                 analysis = inference.analyze_refinement(query, tools_json)
-                print("\n--- Refinement Analysis ---")
+                log("\n--- Refinement Analysis ---")
                 for step in analysis["steps"]:
-                    print(
+                    log(
                         f"Step {step['step']}: {step['action']} "
                         f"(conf: {step['action_confidence']:.3f}, halt: {step['halt_prob']:.3f})"
                     )
                     if step["action"] == "tool_call":
-                        print(
+                        log(
                             f"  → Tool: {step['tool_name']} (conf: {step['tool_confidence']:.3f})"
                         )
-                print()
+                log()
 
             result = inference.generate(query, tools_json)
 
-            print(f"\nAssistant:")
-            print(f"  Action: {result['action']}")
+            log(f"\nAssistant:")
+            log(f"  Action: {result['action']}")
             if result["action"] == "tool_call":
-                print(f"  Tool: {result['tool_name']}")
-                print(f"  Parallel calls: {result.get('num_parallel_calls', 1)}")
+                log(f"  Tool: {result['tool_name']}")
+                log(f"  Parallel calls: {result.get('num_parallel_calls', 1)}")
                 if result.get("tool_call"):
-                    print(f"  Tool Call: {json.dumps(result['tool_call'], indent=4)}")
+                    log(f"  Tool Call: {json.dumps(result['tool_call'], indent=4)}")
             elif result["action"] == "direct_answer":
                 if result.get("response"):
-                    print(f"  Response: {result['response']}")
-            print(f"  Confidence: {result['confidence']:.3f}")
-            print(f"  Steps used: {result['num_steps']}")
+                    log(f"  Response: {result['response']}")
+            log(f"  Confidence: {result['confidence']:.3f}")
+            log(f"  Steps used: {result['num_steps']}")
 
     # Single query mode
     elif args.query:
-        print(f"\nQuery: {args.query}")
+        log("Processing query", query=args.query)
 
         if args.analyze:
-            print("\n--- Refinement Analysis ---")
             analysis = inference.analyze_refinement(args.query, tools_json)
             for step in analysis["steps"]:
-                print(
-                    f"Step {step['step']}: {step['action']} "
-                    f"(conf: {step['action_confidence']:.3f}, halt: {step['halt_prob']:.3f})"
-                )
+                step_info = {
+                    "step": step['step'],
+                    "action": step['action'],
+                    "action_confidence": f"{step['action_confidence']:.3f}",
+                    "halt_prob": f"{step['halt_prob']:.3f}",
+                }
                 if step["action"] == "tool_call":
-                    print(f"  → Tool: {step['tool_name']} (conf: {step['tool_confidence']:.3f})")
-            print()
+                    step_info["tool_name"] = step['tool_name']
+                    step_info["tool_confidence"] = f"{step['tool_confidence']:.3f}"
+                log("Refinement step", **step_info)
 
         result = inference.generate(args.query, tools_json)
 
-        print(f"\n--- Result ---")
-        print(f"Action: {result['action']}")
+        result_info = {
+            "action": result['action'],
+            "confidence": f"{result['confidence']:.3f}",
+            "steps_used": result['num_steps'],
+        }
         if result["action"] == "tool_call":
-            print(f"Tool: {result['tool_name']}")
-            print(f"Tool ID: {result['tool_id']}")
-            print(f"Parallel calls: {result.get('num_parallel_calls', 1)}")
+            result_info["tool_name"] = result['tool_name']
+            result_info["tool_id"] = result['tool_id']
+            result_info["parallel_calls"] = result.get('num_parallel_calls', 1)
             if result.get("tool_call"):
-                print(f"Tool Call: {json.dumps(result['tool_call'], indent=2)}")
+                result_info["tool_call"] = json.dumps(result['tool_call'])
         elif result["action"] == "direct_answer":
             if result.get("response"):
-                print(f"Response: {result['response']}")
-        print(f"Confidence: {result['confidence']:.3f}")
-        print(f"Steps used: {result['num_steps']}")
+                result_info["response"] = result['response']
+
+        log("Inference result", **result_info)
 
     else:
-        print("\nError: Either --query or --interactive must be specified")
+        log_error("Either --query or --interactive must be specified")
         sys.exit(1)
 
 

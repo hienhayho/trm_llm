@@ -11,7 +11,7 @@ The key insight from TRM paper:
 
 import torch
 import torch.nn as nn
-from .transformer_blocks import TinyTransformer
+from trm_llm.models.transformer_blocks import TinyTransformer
 
 
 class RecursiveReasoningModule(nn.Module):
