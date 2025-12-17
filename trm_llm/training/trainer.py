@@ -16,7 +16,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-from torch.utils.data import DataLoader, DistributedSampler
+from torch.utils.data import DataLoader
 from tqdm import tqdm
 from typing import Optional, Dict, Literal
 import os
@@ -24,7 +24,12 @@ import os
 from trm_llm.utils.config import TRMLLMConfig
 from trm_llm.data.tokenizer import ToolCallTokenizer
 from trm_llm.utils.logger import log, log_warning, reset_main_process_cache
-from trm_llm.training.loss import compute_trm_loss, compute_action_accuracy, compute_per_step_accuracy, compute_valid_json_accuracy
+from trm_llm.training.loss import (
+    compute_trm_loss,
+    compute_action_accuracy,
+    compute_per_step_accuracy,
+    compute_valid_tool_call_format_accuracy,
+)
 
 
 def setup_distributed(rank: int = None, world_size: int = None, backend: str = "nccl"):
@@ -89,7 +94,11 @@ def _init_distributed_for_muon():
         )
         log("Initialized distributed environment for Muon", port=port)
     except Exception as e:
-        log_warning("Could not initialize distributed environment", error=str(e), note="Muon may not work correctly")
+        log_warning(
+            "Could not initialize distributed environment",
+            error=str(e),
+            note="Muon may not work correctly",
+        )
         raise
 
 
@@ -130,27 +139,32 @@ def create_muon_optimizer(
 
     # Categorize parameters
     hidden_weights = []  # For Muon (ndim >= 2)
-    other_params = []    # For AdamW (embeddings, heads, biases)
+    other_params = []  # For AdamW (embeddings, heads, biases)
 
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
 
         # Use Muon for hidden weights in encoder, reasoning, and action modules
-        is_hidden_module = any(mod in name for mod in [
-            'encoder',
-            'reasoning_module',
-            'action_module',
-        ])
+        is_hidden_module = any(
+            mod in name
+            for mod in [
+                "encoder",
+                "reasoning_module",
+                "action_module",
+            ]
+        )
 
         if is_hidden_module and param.ndim >= 2:
             hidden_weights.append(param)
         else:
             other_params.append(param)
 
-    log("Muon optimizer parameter groups",
+    log(
+        "Muon optimizer parameter groups",
         hidden_weights_muon=f"{sum(p.numel() for p in hidden_weights) / 1e6:.2f}M params",
-        other_params_adamw=f"{sum(p.numel() for p in other_params) / 1e6:.2f}M params")
+        other_params_adamw=f"{sum(p.numel() for p in other_params) / 1e6:.2f}M params",
+    )
 
     param_groups = [
         dict(
@@ -229,16 +243,26 @@ class TRMTrainer:
 
         # Get special token IDs for weighted loss (e.g., <tool_call>, </tool_call>)
         self.special_token_ids = []
+        self.tool_call_token_id = None
         if tokenizer is not None:
             special_tokens = [
                 tokenizer.TOOL_CALL_START,  # <tool_call>
-                tokenizer.TOOL_CALL_END,    # </tool_call>
+                tokenizer.TOOL_CALL_END,  # </tool_call>
             ]
             for token in special_tokens:
-                token_id = tokenizer.tokenizer.convert_tokens_to_ids(token)
-                if token_id != tokenizer.tokenizer.unk_token_id:
+                token_id = tokenizer.convert_tokens_to_ids(token)
+                if token_id != tokenizer.unk_token_id:
                     self.special_token_ids.append(token_id)
 
+            # Get tool_call start token ID for consistency loss
+            self.tool_call_token_id = tokenizer.convert_tokens_to_ids(tokenizer.TOOL_CALL_START)
+            if self.tool_call_token_id == tokenizer.unk_token_id:
+                self.tool_call_token_id = None
+        self._log_struct(
+            "Special token IDs for loss weighting",
+            special_token_ids=self.special_token_ids,
+            tool_call_token_id=self.tool_call_token_id,
+        )
         # DDP setup
         if use_ddp:
             self.rank = dist.get_rank() if dist.is_initialized() else 0
@@ -246,8 +270,8 @@ class TRMTrainer:
             self.is_main = self.rank == 0
             # Move model to correct device and wrap with DDP
             model = model.to(device)
-            # find_unused_parameters=True handles cases where some params don't participate
-            # in loss for certain batches (e.g., generation head only used on last step)
+            # find_unused_parameters=True required because generation head is only used
+            # on the last supervision step, so its params don't participate every iteration
             self.model = DDP(
                 model,
                 device_ids=[local_rank],
@@ -269,7 +293,12 @@ class TRMTrainer:
 
         # Optimizer (use raw model for parameter groups)
         if optimizer_type == "muon":
-            self._log_struct("Using Muon optimizer", muon_lr=muon_lr, adam_lr=config.learning_rate, momentum=muon_momentum)
+            self._log_struct(
+                "Using Muon optimizer",
+                muon_lr=muon_lr,
+                adam_lr=config.learning_rate,
+                momentum=muon_momentum,
+            )
             self.optimizer = create_muon_optimizer(
                 self.raw_model,
                 muon_lr=muon_lr,
@@ -278,7 +307,9 @@ class TRMTrainer:
                 muon_momentum=muon_momentum,
             )
         else:
-            self._log_struct("Using AdamW optimizer", lr=config.learning_rate, weight_decay=config.weight_decay)
+            self._log_struct(
+                "Using AdamW optimizer", lr=config.learning_rate, weight_decay=config.weight_decay
+            )
             self.optimizer = torch.optim.AdamW(
                 self.raw_model.parameters(),
                 lr=config.learning_rate,
@@ -345,19 +376,33 @@ class TRMTrainer:
             target_generation_ids=batch.get("target_generation_ids"),
         )
 
-        # Compute loss (with special token weighting for tool call structure)
+        # Compute loss (with special token weighting and action-generation consistency)
         loss, loss_dict = compute_trm_loss(
-            outputs_per_step, batch, self.config,
-            special_token_ids=self.special_token_ids if self.special_token_ids else None
+            outputs_per_step,
+            batch,
+            self.config,
+            special_token_ids=self.special_token_ids if self.special_token_ids else None,
+            tool_call_token_id=self.tool_call_token_id,
         )
 
         # Compute accuracies
         acc_dict = compute_action_accuracy(outputs_per_step, batch)
 
-        # Compute valid JSON accuracy for tool params
+        # Compute strict tool call format accuracy: <tool_call>{...}</tool_call>
+        # Return counts for proper aggregation (avoids dilution from batches without tool_calls)
         if self.tokenizer is not None:
-            valid_json_acc = compute_valid_json_accuracy(outputs_per_step, batch, self.tokenizer)
-            acc_dict['valid_json'] = valid_json_acc
+            valid_count, total_count, sample_correct = compute_valid_tool_call_format_accuracy(
+                outputs_per_step, batch, self.tokenizer, return_counts=True, return_sample=True
+            )
+            acc_dict["valid_tool_format_correct"] = valid_count
+            acc_dict["valid_tool_format_total"] = total_count
+            # Log sample correct prediction if any valid
+            if valid_count > 0 and sample_correct is not None and self.is_main:
+                self._log_struct(
+                    "Valid tool call prediction",
+                    step=self.global_step,
+                    prediction=sample_correct,
+                )
 
         # Backward pass
         loss.backward()
@@ -394,7 +439,7 @@ class TRMTrainer:
         total_metrics = {}
 
         # Set epoch for distributed sampler
-        if self.use_ddp and hasattr(self.train_loader.sampler, 'set_epoch'):
+        if self.use_ddp and hasattr(self.train_loader.sampler, "set_epoch"):
             self.train_loader.sampler.set_epoch(epoch)
 
         # Only show progress bar on main process
@@ -416,11 +461,14 @@ class TRMTrainer:
             if self.is_main and batch_idx % 10 == 0:
                 n = batch_idx + 1
                 avg_loss = total_loss / n
-                avg_act = total_metrics.get('action_accuracy', 0.0) / n
-                avg_n_calls = total_metrics.get('num_calls_accuracy', 0.0) / n
-                avg_tool_gen = total_metrics.get('tool_gen_accuracy', 0.0) / n
-                avg_direct_gen = total_metrics.get('direct_gen_accuracy', 0.0) / n
-                avg_json = total_metrics.get('valid_json', 0.0) / n
+                avg_act = total_metrics.get("action_accuracy", 0.0) / n
+                avg_n_calls = total_metrics.get("num_calls_accuracy", 0.0) / n
+                avg_tool_gen = total_metrics.get("tool_gen_accuracy", 0.0) / n
+                avg_direct_gen = total_metrics.get("direct_gen_accuracy", 0.0) / n
+                # Compute tool_fmt from accumulated counts (not averaged ratios)
+                tool_fmt_correct = total_metrics.get("valid_tool_format_correct", 0)
+                tool_fmt_total = total_metrics.get("valid_tool_format_total", 0)
+                avg_tool_fmt = tool_fmt_correct / tool_fmt_total if tool_fmt_total > 0 else 0.0
                 pbar.set_postfix(
                     {
                         "loss": f"{avg_loss:.4f}",
@@ -428,19 +476,26 @@ class TRMTrainer:
                         "n_calls": f"{avg_n_calls:.3f}",
                         "tool_call": f"{avg_tool_gen:.3f}",
                         "direct_answer": f"{avg_direct_gen:.3f}",
-                        "json": f"{avg_json:.3f}",
+                        "tool_fmt": f"{avg_tool_fmt:.3f}",
                     }
                 )
 
             # Log sample prediction at intervals (if enabled)
             if self.log_sample_interval > 0 and self.global_step % self.log_sample_interval == 0:
                 sample_idx = random.randint(0, len(self.train_loader.dataset) - 1)
-                self.log_sample_prediction(sample_idx=sample_idx, context=f"step {self.global_step}")
+                self.log_sample_prediction(
+                    sample_idx=sample_idx, context=f"step {self.global_step}"
+                )
 
         # Average metrics
         num_batches = len(self.train_loader)
-        avg_metrics = {key: value / num_batches for key, value in total_metrics.items()}
+        avg_metrics = {key: value / num_batches for key, value in total_metrics.items()
+                       if key not in ("valid_tool_format_correct", "valid_tool_format_total")}
         avg_metrics["loss"] = total_loss / num_batches
+        # Compute valid_tool_format from accumulated counts
+        tool_fmt_correct = total_metrics.get("valid_tool_format_correct", 0)
+        tool_fmt_total = total_metrics.get("valid_tool_format_total", 0)
+        avg_metrics["valid_tool_format"] = tool_fmt_correct / tool_fmt_total if tool_fmt_total > 0 else 0.0
 
         return avg_metrics
 
@@ -476,28 +531,40 @@ class TRMTrainer:
                 target_generation_ids=batch.get("target_generation_ids"),
             )
 
-            # Compute loss (with special token weighting)
+            # Compute loss (with special token weighting and action-generation consistency)
             loss, loss_dict = compute_trm_loss(
-                outputs_per_step, batch, self.config,
-                special_token_ids=self.special_token_ids if self.special_token_ids else None
+                outputs_per_step,
+                batch,
+                self.config,
+                special_token_ids=self.special_token_ids if self.special_token_ids else None,
+                tool_call_token_id=self.tool_call_token_id,
             )
 
             # Compute accuracies
             acc_dict = compute_action_accuracy(outputs_per_step, batch)
 
-            # Compute valid JSON accuracy
+            # Compute strict tool call format accuracy: <tool_call>{...}</tool_call>
+            # Return counts for proper aggregation
             if self.tokenizer is not None:
-                valid_json_acc = compute_valid_json_accuracy(outputs_per_step, batch, self.tokenizer)
-                acc_dict['valid_json'] = valid_json_acc
+                valid_count, total_count = compute_valid_tool_call_format_accuracy(
+                    outputs_per_step, batch, self.tokenizer, return_counts=True
+                )
+                acc_dict["valid_tool_format_correct"] = valid_count
+                acc_dict["valid_tool_format_total"] = total_count
 
             total_loss += loss.item()
             for key, value in {**loss_dict, **acc_dict}.items():
                 total_metrics[key] = total_metrics.get(key, 0.0) + value
 
-        # Average
+        # Average (exclude count metrics from averaging)
         num_batches = len(self.val_loader)
-        val_metrics = {f"val_{key}": value / num_batches for key, value in total_metrics.items()}
+        val_metrics = {f"val_{key}": value / num_batches for key, value in total_metrics.items()
+                       if key not in ("valid_tool_format_correct", "valid_tool_format_total")}
         val_metrics["val_loss"] = total_loss / num_batches
+        # Compute valid_tool_format from accumulated counts
+        tool_fmt_correct = total_metrics.get("valid_tool_format_correct", 0)
+        tool_fmt_total = total_metrics.get("valid_tool_format_total", 0)
+        val_metrics["val_valid_tool_format"] = tool_fmt_correct / tool_fmt_total if tool_fmt_total > 0 else 0.0
 
         return val_metrics
 
@@ -518,18 +585,18 @@ class TRMTrainer:
         # Get a sample from dataset
         dataset = self.train_loader.dataset
         # Handle DistributedSampler wrapper
-        if hasattr(dataset, 'dataset'):
+        if hasattr(dataset, "dataset"):
             base_dataset = dataset.dataset
-            actual_idx = dataset.indices[sample_idx] if hasattr(dataset, 'indices') else sample_idx
+            actual_idx = dataset.indices[sample_idx] if hasattr(dataset, "indices") else sample_idx
             sample = base_dataset[actual_idx]
         else:
             sample = dataset[sample_idx]
 
         # Prepare batch (single sample)
-        input_ids = torch.tensor([sample['input_ids']], device=self.device)
-        target_action = sample['target_action']
-        target_num_calls = sample.get('target_num_calls', 0)
-        target_generation_ids = sample.get('target_generation_ids', [])
+        input_ids = torch.tensor([sample["input_ids"]], device=self.device)
+        target_action = sample["target_action"]
+        target_num_calls = sample.get("target_num_calls", 0)
+        target_generation_ids = sample.get("target_generation_ids", [])
 
         # Forward pass (use raw model for inference)
         outputs_per_step = self.raw_model(
@@ -541,23 +608,23 @@ class TRMTrainer:
         final_output = outputs_per_step[-1]
 
         # Decode predictions
-        action_probs = F.softmax(final_output['action_logits'][0], dim=-1)
+        action_probs = F.softmax(final_output["action_logits"][0], dim=-1)
         pred_action = action_probs.argmax().item()
         action_conf = action_probs[pred_action].item()
 
         pred_num_calls = 1
-        if 'num_calls_logits' in final_output:
-            num_calls_probs = F.softmax(final_output['num_calls_logits'][0], dim=-1)
+        if "num_calls_logits" in final_output:
+            num_calls_probs = F.softmax(final_output["num_calls_logits"][0], dim=-1)
             pred_num_calls = num_calls_probs.argmax().item() + 1
 
         # Build sample prediction info
-        input_text = self.tokenizer.decode(sample['input_ids'][:200])
+        input_text = self.tokenizer.decode(sample["input_ids"][:200])
         target_action_str = "tool_call" if target_action == 1 else "direct_answer"
         pred_action_str = "tool_call" if pred_action == 1 else "direct_answer"
         action_match = "match" if pred_action == target_action else "mismatch"
 
         sample_pred = {
-            "input_tokens": len(sample['input_ids']),
+            "input_tokens": len(sample["input_ids"]),
             "input_preview": input_text + "...",
             "target_action": target_action_str,
             "pred_action": pred_action_str,
@@ -577,8 +644,8 @@ class TRMTrainer:
             sample_pred["target_generation"] = f"({len(target_generation_ids)} tokens) {gen_text}"
 
         # Generate output
-        if hasattr(self.raw_model, 'generate'):
-            y_state = final_output['y_state']
+        if hasattr(self.raw_model, "generate"):
+            y_state = final_output["y_state"]
             gen_ids = self.raw_model.generate(y_state, max_length=128)
             gen_text = self.tokenizer.decode(gen_ids[0].tolist(), skip_special_tokens=True)
             if len(gen_text) > 300:
@@ -617,7 +684,7 @@ class TRMTrainer:
         }
 
         torch.save(checkpoint, filepath)
-        log("Checkpoint saved", path=filepath, epoch=epoch)
+        log("Checkpoint saved", path=filepath, epoch=epoch + 1)
 
     def load_checkpoint(self, filepath: str):
         """Load model checkpoint
@@ -636,7 +703,9 @@ class TRMTrainer:
         self.global_step = checkpoint["global_step"]
         self.current_max_steps = checkpoint.get("current_max_steps", 2)
 
-        self._log_struct("Checkpoint loaded", path=filepath, epoch=self.current_epoch, step=self.global_step)
+        self._log_struct(
+            "Checkpoint loaded", path=filepath, epoch=self.current_epoch, step=self.global_step
+        )
 
     def train(self, save_dir: str = "checkpoints"):
         """Full training loop
@@ -665,10 +734,12 @@ class TRMTrainer:
             self.update_curriculum(epoch)
 
             # Train epoch
-            self._log_struct("Epoch started",
+            self._log_struct(
+                "Epoch started",
                 epoch=f"{epoch+1}/{self.config.max_epochs}",
                 max_supervision_steps=self.current_max_steps,
-                learning_rate=f"{self.scheduler.get_last_lr()[0]:.6f}")
+                learning_rate=f"{self.scheduler.get_last_lr()[0]:.6f}",
+            )
 
             train_metrics = self.train_epoch(epoch)
 
@@ -677,26 +748,30 @@ class TRMTrainer:
                 dist.barrier()
 
             # Print training metrics (main process only)
-            self._log_struct("Training results",
+            self._log_struct(
+                "Training results",
                 loss=f"{train_metrics['loss']:.4f}",
                 action_acc=f"{train_metrics['action_accuracy']:.3f}",
                 num_calls_acc=f"{train_metrics.get('num_calls_accuracy', 0.0):.3f}",
                 tool_gen_acc=f"{train_metrics.get('tool_gen_accuracy', 0.0):.3f}",
                 direct_gen_acc=f"{train_metrics.get('direct_gen_accuracy', 0.0):.3f}",
-                valid_json=f"{train_metrics.get('valid_json', 0.0):.3f}",
-                overall_acc=f"{train_metrics['overall_accuracy']:.3f}")
+                valid_tool_format=f"{train_metrics.get('valid_tool_format', 0.0):.3f}",
+                overall_acc=f"{train_metrics['overall_accuracy']:.3f}",
+            )
 
             # Validate
             if self.val_loader is not None:
                 val_metrics = self.validate()
-                self._log_struct("Validation results",
+                self._log_struct(
+                    "Validation results",
                     loss=f"{val_metrics['val_loss']:.4f}",
                     action_acc=f"{val_metrics['val_action_accuracy']:.3f}",
                     num_calls_acc=f"{val_metrics.get('val_num_calls_accuracy', 0.0):.3f}",
                     tool_gen_acc=f"{val_metrics.get('val_tool_gen_accuracy', 0.0):.3f}",
                     direct_gen_acc=f"{val_metrics.get('val_direct_gen_accuracy', 0.0):.3f}",
-                    valid_json=f"{val_metrics.get('val_valid_json', 0.0):.3f}",
-                    overall_acc=f"{val_metrics['val_overall_accuracy']:.3f}")
+                    valid_tool_format=f"{val_metrics.get('val_valid_tool_format', 0.0):.3f}",
+                    overall_acc=f"{val_metrics['val_overall_accuracy']:.3f}",
+                )
 
                 # Save best model (main process only via save_checkpoint)
                 if val_metrics["val_overall_accuracy"] > self.best_val_acc:

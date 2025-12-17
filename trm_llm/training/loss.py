@@ -15,6 +15,7 @@ def compute_trm_loss(
     targets: Dict[str, torch.Tensor],
     config: TRMLLMConfig,
     special_token_ids: Optional[List[int]] = None,
+    tool_call_token_id: Optional[int] = None,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """Compute TRM loss across all supervision steps
 
@@ -36,6 +37,7 @@ def compute_trm_loss(
         config: TRMLLMConfig
         special_token_ids: Optional list of token IDs for special tokens (e.g., <tool_call>, </tool_call>)
             that should receive higher weight in generation loss
+        tool_call_token_id: Token ID for <tool_call> token (for consistency loss)
 
     Returns:
         total_loss: Averaged loss across all supervision steps
@@ -48,6 +50,7 @@ def compute_trm_loss(
         'halt': 0.0,
         'tool_call_gen': 0.0,
         'direct_answer_gen': 0.0,
+        'consistency': 0.0,
     }
 
     num_steps = len(outputs_per_step)
@@ -94,6 +97,7 @@ def compute_trm_loss(
         # Separate losses for tool_call and direct_answer to allow different weights
         tool_call_gen_loss = torch.tensor(0.0, device=action_loss.device)
         direct_answer_gen_loss = torch.tensor(0.0, device=action_loss.device)
+        consistency_loss = torch.tensor(0.0, device=action_loss.device)
 
         if 'generation_logits' in outputs:
             gen_logits = outputs['generation_logits']  # (batch_size, seq_len, vocab_size)
@@ -152,16 +156,26 @@ def compute_trm_loss(
             losses['tool_call_gen'] += tool_call_gen_loss.item()
             losses['direct_answer_gen'] += direct_answer_gen_loss.item()
 
+            # ===== 5. Action-Generation Consistency Loss =====
+            # Aligns action prediction with generation format
+            if tool_call_token_id is not None:
+                consistency_loss = compute_action_generation_consistency_loss(
+                    [outputs], targets, tool_call_token_id
+                )
+                losses['consistency'] += consistency_loss.item()
+
         # ===== Combine Losses =====
         # Weights for different loss components
         action_loss_weight = getattr(config, 'action_loss_weight', 2.0)  # Higher weight for action classification
         tool_call_gen_weight = getattr(config, 'tool_call_gen_weight', 2.0)  # Higher weight for tool calls
         direct_answer_gen_weight = getattr(config, 'direct_answer_gen_weight', 1.0)
+        consistency_loss_weight = getattr(config, 'consistency_loss_weight', 1.0)  # Weight for action-generation alignment
 
         step_loss = (action_loss_weight * action_loss + num_calls_loss +
                      config.halt_loss_weight * halt_loss +
                      tool_call_gen_weight * tool_call_gen_loss +
-                     direct_answer_gen_weight * direct_answer_gen_loss)
+                     direct_answer_gen_weight * direct_answer_gen_loss +
+                     consistency_loss_weight * consistency_loss)
         total_loss += step_loss
 
         # Accumulate for logging
@@ -277,24 +291,95 @@ def compute_per_step_accuracy(
     return accuracies
 
 
-def compute_valid_json_accuracy(
+def compute_action_generation_consistency_loss(
     outputs_per_step: List[Dict[str, torch.Tensor]],
     targets: Dict[str, torch.Tensor],
-    tokenizer
-) -> float:
-    """Compute accuracy of generating valid JSON for tool call examples
+    tool_call_token_id: int,
+) -> torch.Tensor:
+    """Compute consistency loss between action prediction and generation output
 
-    Handles Hermes format where JSON is wrapped in <tool_call>...</tool_call> tags.
+    This loss penalizes mismatches where:
+    - Action head predicts tool_call but generation doesn't start with <tool_call>
+    - Action head predicts direct_answer but generation starts with <tool_call>
+
+    This helps align the action prediction head with the generation head.
+
+    Args:
+        outputs_per_step: List of model outputs
+        targets: Ground truth targets
+        tool_call_token_id: Token ID for <tool_call> token
+
+    Returns:
+        consistency_loss: Scalar loss tensor
+    """
+    final_outputs = outputs_per_step[-1]
+
+    if 'generation_logits' not in final_outputs:
+        return torch.tensor(0.0, device=final_outputs['action_logits'].device)
+
+    gen_logits = final_outputs['generation_logits']  # (batch_size, seq_len, vocab_size)
+    action_logits = final_outputs['action_logits']  # (batch_size, num_action_types)
+
+    if gen_logits.size(1) < 2:
+        return torch.tensor(0.0, device=action_logits.device)
+
+    # Get the first generated token (after BOS/start)
+    # Use position 0 or 1 depending on whether BOS is included
+    first_token_logits = gen_logits[:, 0, :]  # (batch_size, vocab_size)
+
+    # Probability that first token is <tool_call>
+    first_token_probs = F.softmax(first_token_logits, dim=-1)
+    prob_tool_call_token = first_token_probs[:, tool_call_token_id]  # (batch_size,)
+
+    # Probability that action is tool_call (index 1)
+    action_probs = F.softmax(action_logits, dim=-1)
+    prob_action_tool_call = action_probs[:, 1]  # (batch_size,)
+
+    # Consistency loss: action prediction should match generation format
+    # If action predicts tool_call (prob high), generation should start with <tool_call> (prob high)
+    # Use MSE or BCE to align these probabilities
+    consistency_loss = F.mse_loss(prob_action_tool_call, prob_tool_call_token)
+
+    return consistency_loss
+
+
+def compute_valid_tool_call_format_accuracy(
+    outputs_per_step: List[Dict[str, torch.Tensor]],
+    targets: Dict[str, torch.Tensor],
+    tokenizer,
+    return_counts: bool = False,
+    return_sample: bool = False
+):
+    """Compute accuracy of generating tool calls with exact format
+
+    Checks if generation follows EXACTLY: <tool_call>{...}</tool_call>
+    - Must start with <tool_call>
+    - Must end with </tool_call>
+    - Must have valid JSON in between
+    - No content before or after the tags
 
     Args:
         outputs_per_step: List of model outputs
         targets: Ground truth targets
         tokenizer: Tokenizer for decoding tokens
+        return_counts: If True, return (valid_count, total_count) for proper aggregation
+        return_sample: If True, also return sample_correct_prediction
 
     Returns:
-        valid_json_ratio: Ratio of tool_call examples with valid JSON generation
+        If return_counts=False, return_sample=False: accuracy (float)
+        If return_counts=True, return_sample=False: (valid_count, total_count)
+        If return_counts=False, return_sample=True: (accuracy, sample_text)
+        If return_counts=True, return_sample=True: (valid_count, total_count, sample_text)
     """
+    import re
+
     if tokenizer is None:
+        if return_counts and return_sample:
+            return 0, 0, None
+        elif return_counts:
+            return 0, 0
+        elif return_sample:
+            return 0.0, None
         return 0.0
 
     final_outputs = outputs_per_step[-1]
@@ -302,9 +387,21 @@ def compute_valid_json_accuracy(
     # Only check tool_call examples
     tool_mask = (targets['target_action'] == 1)
     if not tool_mask.any():
+        if return_counts and return_sample:
+            return 0, 0, None
+        elif return_counts:
+            return 0, 0
+        elif return_sample:
+            return 0.0, None
         return 0.0
 
     if 'generation_logits' not in final_outputs:
+        if return_counts and return_sample:
+            return 0, 0, None
+        elif return_counts:
+            return 0, 0
+        elif return_sample:
+            return 0.0, None
         return 0.0
 
     gen_logits = final_outputs['generation_logits']  # (batch_size, seq_len, vocab_size)
@@ -315,6 +412,11 @@ def compute_valid_json_accuracy(
 
     valid_count = 0
     total_count = 0
+    sample_correct = None  # Store first correct prediction
+
+    # Pattern: exactly <tool_call>{...}</tool_call> with optional whitespace
+    # Allows single object {...} or array [{...}, {...}]
+    pattern = r'^\s*<tool_call>\s*(\{.*\}|\[.*\])\s*</tool_call>\s*$'
 
     for i in range(pred_tokens.size(0)):
         if not tool_mask[i]:
@@ -329,42 +431,30 @@ def compute_valid_json_accuracy(
         if not tokens:
             continue
 
-        # Decode tokens to text
         try:
+            # Decode tokens to text
             text = tokenizer.decode(tokens, skip_special_tokens=False)
-            text = text.strip()
 
-            # Remove Hermes tool_call tags if present
-            # Look for content between <tool_call> and </tool_call>
-            tool_call_start = '<tool_call>'
-            tool_call_end = '</tool_call>'
-
-            if tool_call_start in text:
-                start_idx = text.find(tool_call_start) + len(tool_call_start)
-                end_idx = text.find(tool_call_end)
-                if end_idx > start_idx:
-                    text = text[start_idx:end_idx].strip()
-
-            # Try to find and parse JSON (could be single object or array)
-            # First try array format
-            start_idx = text.find('[')
-            if start_idx != -1:
-                end_idx = text.rfind(']')
-                if end_idx != -1 and end_idx > start_idx:
-                    json_str = text[start_idx:end_idx + 1]
-                    json.loads(json_str)  # Will raise if invalid
-                    valid_count += 1
-                    continue
-
-            # Try single object format
-            start_idx = text.find('{')
-            end_idx = text.rfind('}')
-
-            if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
-                json_str = text[start_idx:end_idx + 1]
-                json.loads(json_str)  # Will raise if invalid
+            # Check if matches exact pattern
+            match = re.match(pattern, text, re.DOTALL)
+            if match:
+                # Also verify the JSON inside is valid
+                json_content = match.group(1)
+                json.loads(json_content)
                 valid_count += 1
+                # Store first correct prediction
+                if sample_correct is None:
+                    sample_correct = text.strip()
+
         except (json.JSONDecodeError, Exception):
             pass
 
-    return valid_count / total_count if total_count > 0 else 0.0
+    accuracy = valid_count / total_count if total_count > 0 else 0.0
+
+    if return_counts and return_sample:
+        return valid_count, total_count, sample_correct
+    elif return_counts:
+        return valid_count, total_count
+    elif return_sample:
+        return accuracy, sample_correct
+    return accuracy

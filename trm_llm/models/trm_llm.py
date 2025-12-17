@@ -6,8 +6,6 @@ Integrates all components:
 - Action state module (updates y based on z)
 - Output heads (decode y into decisions)
 - Deep supervision loop (progressively improves answer)
-
-Supports loading pretrained embeddings from models like Qwen, LLaMA, etc.
 """
 
 import torch
@@ -15,12 +13,10 @@ import torch.nn as nn
 from typing import Optional, Dict, List
 
 from trm_llm.utils.config import TRMLLMConfig
-from trm_llm.utils.logger import log, log_warning
 from trm_llm.models.transformer_blocks import TransformerEncoder, PositionalEncoding
 from trm_llm.models.reasoning_module import RecursiveReasoningModule
 from trm_llm.models.action_module import ActionStateModule
 from trm_llm.models.output_heads import OutputHeads, UnifiedGenerationHead
-from trm_llm.models.pretrained_loader import load_pretrained_weights, freeze_module, count_parameters
 
 
 class TRMLLM(nn.Module):
@@ -125,11 +121,7 @@ class TRMLLM(nn.Module):
         batch_size, seq_len = input_ids.shape
 
         # Token embeddings
-        token_embeds = self.token_embedding(input_ids)  # (batch_size, seq_len, embed_dim)
-
-        # Project if using pretrained embeddings with different hidden dim
-        if hasattr(self, "embed_proj") and self.embed_proj is not None:
-            token_embeds = self.embed_proj(token_embeds)  # (batch_size, seq_len, hidden_dim)
+        token_embeds = self.token_embedding(input_ids)  # (batch_size, seq_len, hidden_dim)
 
         # Position embeddings
         positions = torch.arange(seq_len, device=input_ids.device).unsqueeze(0)
@@ -212,10 +204,11 @@ class TRMLLM(nn.Module):
             outputs = self.output_heads(y)  # Dict with action_logits, num_calls_logits, halt_logit
 
             # 3d. Generate logits if target provided (only on last step for efficiency)
-            # Pass encoder output for cross-attention (enables attending to all input tokens)
+            # Pass encoder output and action_logits for action-conditioned generation
             if step == max_steps - 1 and target_generation_ids is not None:
                 generation_logits = self.generation_head(
-                    y, target_ids=target_generation_ids, encoder_output=x_encoded
+                    y, target_ids=target_generation_ids, encoder_output=x_encoded,
+                    action_logits=outputs["action_logits"]
                 )
                 outputs["generation_logits"] = generation_logits
 
@@ -228,10 +221,11 @@ class TRMLLM(nn.Module):
             if not training:
                 halt_prob = torch.sigmoid(outputs["halt_logit"]).mean().item()
                 if halt_prob > self.config.halt_threshold:
-                    # Generate on early stop too
+                    # Generate on early stop too (with action conditioning)
                     if target_generation_ids is not None and "generation_logits" not in outputs:
                         generation_logits = self.generation_head(
-                            y, target_ids=target_generation_ids, encoder_output=x_encoded
+                            y, target_ids=target_generation_ids, encoder_output=x_encoded,
+                            action_logits=outputs["action_logits"]
                         )
                         outputs["generation_logits"] = generation_logits
                     break
@@ -258,6 +252,7 @@ class TRMLLM(nn.Module):
         top_k: int = 50,
         top_p: float = 0.9,
         no_repeat_ngram_size: int = 3,
+        action_logits: torch.Tensor = None,
     ) -> torch.Tensor:
         """Generate tokens from action state
 
@@ -271,6 +266,8 @@ class TRMLLM(nn.Module):
             top_k: keep only top k tokens for sampling (0 = disabled)
             top_p: nucleus sampling - keep tokens with cumulative prob < top_p
             no_repeat_ngram_size: prevent repeating n-grams of this size (0 = disabled)
+            action_logits: (batch_size, num_action_types) - action prediction logits
+                          for conditioning generation on predicted action
 
         Returns:
             generated_ids: (batch_size, seq_len) - generated token IDs
@@ -279,7 +276,8 @@ class TRMLLM(nn.Module):
             y_state, max_length=max_length, temperature=temperature,
             eos_token_id=eos_token_id, encoder_output=encoder_output,
             repetition_penalty=repetition_penalty, top_k=top_k,
-            top_p=top_p, no_repeat_ngram_size=no_repeat_ngram_size
+            top_p=top_p, no_repeat_ngram_size=no_repeat_ngram_size,
+            action_logits=action_logits
         )
 
     def get_num_params(self):
@@ -289,187 +287,6 @@ class TRMLLM(nn.Module):
     def get_num_trainable_params(self):
         """Count trainable parameters"""
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
-
-    def load_pretrained_embeddings(
-        self,
-        model_name_or_path: str,
-        freeze: bool = True,
-        device: str = "cpu",
-        tokenizer_vocab_size: Optional[int] = None,
-    ):
-        """Load pretrained token embeddings and LM head from a causal LM
-
-        This replaces:
-        - self.token_embedding with pretrained embeddings
-        - self.generation_head.token_embedding with pretrained embeddings
-        - self.generation_head.output_proj with pretrained LM head
-
-        Args:
-            model_name_or_path: HuggingFace model name (e.g., "Qwen/Qwen2.5-3B")
-            freeze: Whether to freeze the pretrained weights
-            device: Device to load weights to
-            tokenizer_vocab_size: Vocab size from tokenizer (may include added special tokens)
-        """
-        log("Loading pretrained weights", model=model_name_or_path, freeze=freeze)
-
-        # Load pretrained weights (pass tokenizer vocab size to handle special tokens)
-        pretrained_embed, pretrained_lm_head, vocab_size, hidden_dim = load_pretrained_weights(
-            model_name_or_path, device=device, new_vocab_size=tokenizer_vocab_size
-        )
-
-        # Check dimension compatibility
-        if hidden_dim != self.config.hidden_dim:
-            log_warning("Hidden dim mismatch - adding projection layers",
-                pretrained=hidden_dim, config=self.config.hidden_dim)
-
-            # Add projection from pretrained hidden_dim to config hidden_dim
-            self.embed_proj = nn.Linear(hidden_dim, self.config.hidden_dim).to(device)
-            self._pretrained_hidden_dim = hidden_dim
-        else:
-            self.embed_proj = None
-            self._pretrained_hidden_dim = hidden_dim
-
-        # Replace token embedding (for encoder input)
-        self.token_embedding = pretrained_embed
-
-        # Update generation head to use pretrained embeddings and LM head
-        # Need to handle dimension mismatch for generation head too
-        gen_hidden_dim = getattr(self.config, "generation_hidden_dim", 384)
-
-        # Replace generation head token embedding
-        self.generation_head.token_embedding = nn.Embedding(vocab_size, gen_hidden_dim).to(device)
-        # Project from pretrained embedding to generation hidden dim if needed
-        if hidden_dim != gen_hidden_dim:
-            self.generation_head._pretrained_embed = pretrained_embed
-            self.generation_head._embed_proj = nn.Linear(hidden_dim, gen_hidden_dim).to(device)
-            # Override forward to use projection
-            original_forward = self.generation_head.forward
-
-            def new_forward(y_state, target_ids=None, max_length=None, encoder_output=None):
-                if target_ids is not None:
-                    # Project pretrained embeddings
-                    pretrained_embeds = self.generation_head._pretrained_embed(target_ids)
-                    projected_embeds = self.generation_head._embed_proj(pretrained_embeds)
-                    # Add position embeddings
-                    seq_len = target_ids.size(1)
-                    positions = torch.arange(seq_len, device=target_ids.device).unsqueeze(0)
-                    tgt = projected_embeds + self.generation_head.position_embedding(positions)
-                    # Prepare memory for cross-attention (y_state context + encoder output)
-                    memory = self.generation_head._prepare_memory(y_state, encoder_output)
-                    causal_mask = self.generation_head._get_causal_mask(seq_len, target_ids.device)
-                    output = self.generation_head.decoder(tgt, memory, tgt_mask=causal_mask)
-                    logits = self.generation_head.output_proj(output)
-                    return logits
-                else:
-                    return original_forward(y_state, target_ids, max_length, encoder_output)
-
-            self.generation_head.forward = new_forward
-        else:
-            self.generation_head.token_embedding = pretrained_embed
-
-        # Replace LM head (output projection)
-        # Need projection if generation hidden dim != pretrained hidden dim
-        if gen_hidden_dim != hidden_dim:
-            self.generation_head._lm_head_proj = nn.Linear(gen_hidden_dim, hidden_dim).to(device)
-            self.generation_head._pretrained_lm_head = pretrained_lm_head
-
-            # Create new output_proj that projects then uses pretrained LM head
-            class ProjectedLMHead(nn.Module):
-                def __init__(self, proj, lm_head):
-                    super().__init__()
-                    self.proj = proj
-                    self.lm_head = lm_head
-
-                def forward(self, x):
-                    return self.lm_head(self.proj(x))
-
-            self.generation_head.output_proj = ProjectedLMHead(
-                self.generation_head._lm_head_proj, pretrained_lm_head
-            ).to(device)
-        else:
-            self.generation_head.output_proj = pretrained_lm_head
-
-        # Update vocab size
-        self.config.vocab_size = vocab_size
-
-        # Freeze pretrained weights if requested
-        if freeze:
-            self.freeze_pretrained()
-
-        # Print parameter counts
-        param_counts = count_parameters(self)
-        log("Parameter counts after loading pretrained",
-            total=f"{param_counts['total_M']:.1f}M",
-            trainable=f"{param_counts['trainable_M']:.1f}M",
-            frozen=f"{param_counts['frozen_M']:.1f}M")
-
-        return vocab_size, hidden_dim
-
-    def freeze_pretrained(self):
-        """Freeze pretrained components (embeddings and LM head)"""
-        # Freeze token embedding
-        freeze_module(self.token_embedding)
-
-        # Freeze generation head embeddings and LM head
-        if hasattr(self.generation_head, "_pretrained_embed"):
-            freeze_module(self.generation_head._pretrained_embed)
-        if hasattr(self.generation_head, "_pretrained_lm_head"):
-            freeze_module(self.generation_head._pretrained_lm_head)
-        elif hasattr(self.generation_head, "output_proj"):
-            # If output_proj is the pretrained LM head directly
-            if isinstance(self.generation_head.output_proj, nn.Linear):
-                freeze_module(self.generation_head.output_proj)
-            elif hasattr(self.generation_head.output_proj, "lm_head"):
-                freeze_module(self.generation_head.output_proj.lm_head)
-
-        log("Pretrained weights frozen")
-
-    def unfreeze_pretrained(self):
-        """Unfreeze pretrained components for fine-tuning"""
-        from trm_llm.models.pretrained_loader import unfreeze_module
-
-        # Unfreeze token embedding
-        unfreeze_module(self.token_embedding)
-
-        # Unfreeze generation head components
-        if hasattr(self.generation_head, "_pretrained_embed"):
-            unfreeze_module(self.generation_head._pretrained_embed)
-        if hasattr(self.generation_head, "_pretrained_lm_head"):
-            unfreeze_module(self.generation_head._pretrained_lm_head)
-        elif hasattr(self.generation_head, "output_proj"):
-            unfreeze_module(self.generation_head.output_proj)
-
-        log("Pretrained weights unfrozen")
-
-    def get_parameter_groups(self, pretrained_lr: float = 1e-5, trm_lr: float = 1e-4):
-        """Get parameter groups with different learning rates
-
-        Useful for fine-tuning where pretrained weights need lower LR.
-
-        Args:
-            pretrained_lr: Learning rate for pretrained components
-            trm_lr: Learning rate for TRM-specific components
-
-        Returns:
-            List of parameter groups for optimizer
-        """
-        pretrained_params = []
-        trm_params = []
-
-        # Categorize parameters
-        for name, param in self.named_parameters():
-            if not param.requires_grad:
-                continue
-
-            if "token_embedding" in name or "output_proj" in name or "_pretrained" in name:
-                pretrained_params.append(param)
-            else:
-                trm_params.append(param)
-
-        return [
-            {"params": pretrained_params, "lr": pretrained_lr},
-            {"params": trm_params, "lr": trm_lr},
-        ]
 
 
 class TRMLLMWithCache(TRMLLM):

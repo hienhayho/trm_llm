@@ -161,12 +161,13 @@ class UnifiedGenerationHead(nn.Module):
     - Direct answer text
 
     Cross-attends to full encoder output (not just y_state) for better generation.
-    Optionally uses y_state as additional context via a learned prefix token.
+    Uses action-conditioned generation: the predicted action (tool_call vs direct_answer)
+    conditions the generation through learned action embeddings.
     """
 
     def __init__(self, action_dim: int, vocab_size: int, hidden_dim: int = 384,
                  num_layers: int = 3, num_heads: int = 6, max_gen_len: int = 512,
-                 encoder_hidden_dim: int = None):
+                 encoder_hidden_dim: int = None, num_action_types: int = 2):
         """
         Args:
             action_dim: Dimension of action state y
@@ -176,6 +177,7 @@ class UnifiedGenerationHead(nn.Module):
             num_heads: Number of attention heads
             max_gen_len: Maximum generation length
             encoder_hidden_dim: Hidden dimension of encoder output (for projection)
+            num_action_types: Number of action types (2: direct_answer, tool_call)
         """
         super().__init__()
         self.action_dim = action_dim
@@ -183,10 +185,21 @@ class UnifiedGenerationHead(nn.Module):
         self.hidden_dim = hidden_dim
         self.max_gen_len = max_gen_len
         self.encoder_hidden_dim = encoder_hidden_dim or hidden_dim
+        self.num_action_types = num_action_types
 
         # Token embedding for decoder input
         self.token_embedding = nn.Embedding(vocab_size, hidden_dim)
         self.position_embedding = nn.Embedding(max_gen_len, hidden_dim)
+
+        # Action embedding: conditions generation on predicted action type
+        # action 0 = direct_answer, action 1 = tool_call
+        self.action_embedding = nn.Embedding(num_action_types, hidden_dim)
+
+        # Gating mechanism to blend action embedding with y_state
+        self.action_gate = nn.Sequential(
+            nn.Linear(action_dim + hidden_dim, hidden_dim),
+            nn.Sigmoid()
+        )
 
         # Project action state to decoder hidden dim (used as prefix token)
         self.context_proj = nn.Linear(action_dim, hidden_dim)
@@ -216,22 +229,43 @@ class UnifiedGenerationHead(nn.Module):
         mask = mask.masked_fill(mask == 1, float('-inf'))
         return mask
 
-    def _prepare_memory(self, y_state: torch.Tensor, encoder_output: torch.Tensor = None) -> torch.Tensor:
+    def _prepare_memory(self, y_state: torch.Tensor, encoder_output: torch.Tensor = None,
+                        action_logits: torch.Tensor = None) -> torch.Tensor:
         """Prepare memory for cross-attention
 
-        Combines encoder output with y_state context token.
+        Combines encoder output with action-conditioned y_state context token.
 
         Args:
             y_state: (batch_size, action_dim) - action state from TRM
             encoder_output: (batch_size, seq_len, encoder_hidden_dim) - encoder output
+            action_logits: (batch_size, num_action_types) - action prediction logits
 
         Returns:
             memory: (batch_size, memory_len, hidden_dim)
         """
         device = y_state.device
+        batch_size = y_state.size(0)
 
         # Project y_state as a context token
-        y_context = self.context_proj(y_state).unsqueeze(1)  # (batch_size, 1, hidden_dim)
+        y_context = self.context_proj(y_state)  # (batch_size, hidden_dim)
+
+        # Condition on action prediction if provided
+        if action_logits is not None:
+            # Get soft action weights (or hard during inference)
+            action_probs = F.softmax(action_logits, dim=-1)  # (batch_size, num_action_types)
+
+            # Compute weighted action embedding
+            # action_embedding.weight: (num_action_types, hidden_dim)
+            action_embed = torch.matmul(action_probs, self.action_embedding.weight)  # (batch_size, hidden_dim)
+
+            # Gate: blend action embedding with y_context
+            gate_input = torch.cat([y_state, action_embed], dim=-1)  # (batch_size, action_dim + hidden_dim)
+            gate = self.action_gate(gate_input)  # (batch_size, hidden_dim)
+
+            # Gated combination: y_context is modulated by action-specific information
+            y_context = y_context + gate * action_embed
+
+        y_context = y_context.unsqueeze(1)  # (batch_size, 1, hidden_dim)
 
         if encoder_output is not None:
             # Project encoder output if needed
@@ -239,7 +273,7 @@ class UnifiedGenerationHead(nn.Module):
                 encoder_output = self.encoder_proj(encoder_output)
 
             # Prepend y_context to encoder output
-            # This gives the decoder: [y_state_context, encoder_token_1, encoder_token_2, ...]
+            # This gives the decoder: [action_conditioned_y_context, encoder_token_1, encoder_token_2, ...]
             memory = torch.cat([y_context, encoder_output], dim=1)
         else:
             # Fallback: use only y_state (like before)
@@ -248,7 +282,8 @@ class UnifiedGenerationHead(nn.Module):
         return memory
 
     def forward(self, y_state: torch.Tensor, target_ids: torch.Tensor = None,
-                max_length: int = None, encoder_output: torch.Tensor = None) -> torch.Tensor:
+                max_length: int = None, encoder_output: torch.Tensor = None,
+                action_logits: torch.Tensor = None) -> torch.Tensor:
         """Forward pass for training (teacher forcing) or inference
 
         Args:
@@ -257,6 +292,8 @@ class UnifiedGenerationHead(nn.Module):
             max_length: max generation length for inference
             encoder_output: (batch_size, seq_len, encoder_hidden_dim) - full encoder output
                            for cross-attention (enables attending to all input tokens)
+            action_logits: (batch_size, num_action_types) - action prediction logits
+                          for conditioning generation on predicted action
 
         Returns:
             logits: (batch_size, seq_len, vocab_size)
@@ -264,8 +301,8 @@ class UnifiedGenerationHead(nn.Module):
         batch_size = y_state.size(0)
         device = y_state.device
 
-        # Prepare memory for cross-attention (encoder output + y_state context)
-        memory = self._prepare_memory(y_state, encoder_output)
+        # Prepare memory for cross-attention (encoder output + action-conditioned y_state context)
+        memory = self._prepare_memory(y_state, encoder_output, action_logits)
 
         if target_ids is not None:
             # Training mode: teacher forcing
@@ -320,7 +357,8 @@ class UnifiedGenerationHead(nn.Module):
                  repetition_penalty: float = 1.2,
                  top_k: int = 50,
                  top_p: float = 0.9,
-                 no_repeat_ngram_size: int = 3) -> torch.Tensor:
+                 no_repeat_ngram_size: int = 3,
+                 action_logits: torch.Tensor = None) -> torch.Tensor:
         """Generate tokens autoregressively with repetition prevention
 
         Args:
@@ -333,6 +371,8 @@ class UnifiedGenerationHead(nn.Module):
             top_k: keep only top k tokens for sampling (0 = disabled)
             top_p: nucleus sampling - keep tokens with cumulative prob < top_p (1.0 = disabled)
             no_repeat_ngram_size: prevent repeating n-grams of this size (0 = disabled)
+            action_logits: (batch_size, num_action_types) - action prediction logits
+                          for conditioning generation on predicted action
 
         Returns:
             generated_ids: (batch_size, seq_len)
@@ -341,8 +381,8 @@ class UnifiedGenerationHead(nn.Module):
         device = y_state.device
         max_length = max_length or self.max_gen_len
 
-        # Prepare memory for cross-attention
-        memory = self._prepare_memory(y_state, encoder_output)
+        # Prepare memory for cross-attention (action-conditioned)
+        memory = self._prepare_memory(y_state, encoder_output, action_logits)
 
         # Start token
         generated = torch.zeros(batch_size, 1, dtype=torch.long, device=device)

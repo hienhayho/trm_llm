@@ -12,6 +12,7 @@ dependencies = [
     "accelerate>=1.0.1",
     "muon-optimizer",
     "structlog>=25.5.0",
+    "sentencepiece>=0.1.99",
 ]
 
 [project.optional-dependencies]

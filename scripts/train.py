@@ -4,6 +4,9 @@
 Usage (single GPU):
     uv run scripts/train.py --data_path data/train.jsonl
 
+Usage (with pre-trained SentencePiece model):
+    uv run scripts/train.py --data_path data/train.jsonl --sp_model checkpoints/sp_tokenizer.model
+
 Usage (multi-GPU with DDP via torchrun):
     torchrun --nproc_per_node=4 scripts/train.py --data_path data/train.jsonl --ddp
 
@@ -12,6 +15,7 @@ Usage (multi-GPU with uv and torchrun):
 """
 
 import argparse
+import shutil
 import torch
 from torch.utils.data import DataLoader, random_split
 from torch.utils.data.distributed import DistributedSampler
@@ -19,7 +23,7 @@ import os
 
 from trm_llm.models.trm_llm import TRMLLM
 from trm_llm.data.dataset import ToolCallDataset
-from trm_llm.data.tokenizer import ToolCallTokenizer
+from trm_llm.data.sp_tokenizer import SentencePieceTokenizer
 from trm_llm.data.collator import DataCollator
 from trm_llm.training.trainer import TRMTrainer, setup_distributed, cleanup_distributed
 from trm_llm.utils.config import TRMLLMConfig
@@ -39,6 +43,20 @@ def parse_args():
         type=float,
         default=0.0,
         help="Validation split ratio (default: 0.0, only used if eval_path not provided)",
+    )
+
+    # Tokenizer
+    parser.add_argument(
+        "--sp_model",
+        type=str,
+        default=None,
+        help="Path to pre-trained SentencePiece model (.model file). If not provided, trains from dataset.",
+    )
+    parser.add_argument(
+        "--vocab_size",
+        type=int,
+        default=8000,
+        help="Vocabulary size for SentencePiece training (default: 8000, ignored if --sp_model provided)",
     )
 
     # Model
@@ -141,7 +159,7 @@ def parse_args():
         help="Label smoothing for generation loss (default: 0.1, 0.0 = no smoothing)",
     )
 
-    # Architecture options (new)
+    # Architecture options
     parser.add_argument(
         "--use_causal_encoder",
         action="store_true",
@@ -192,25 +210,6 @@ def parse_args():
         help="Skip computing dataset statistics (faster startup for large datasets)",
     )
 
-    # Pretrained model loading
-    parser.add_argument(
-        "--pretrained_model",
-        type=str,
-        default=None,
-        help="HuggingFace model name or path to load pretrained embeddings and LM head from (e.g., Qwen/Qwen2.5-0.5B)",
-    )
-    parser.add_argument(
-        "--freeze_pretrained",
-        action="store_true",
-        default=True,
-        help="Freeze pretrained embeddings and LM head (default: True)",
-    )
-    parser.add_argument(
-        "--no_freeze_pretrained",
-        action="store_true",
-        help="Don't freeze pretrained weights (fine-tune everything)",
-    )
-
     # Distributed training (DDP)
     parser.add_argument(
         "--ddp",
@@ -256,7 +255,10 @@ def main():
         "device": args.device,
         "save_dir": args.save_dir,
         "optimizer": args.optimizer,
+        "vocab_size": args.vocab_size,
     }
+    if args.sp_model:
+        train_config["sp_model"] = args.sp_model
     if use_ddp:
         train_config.update({"rank": rank, "world_size": world_size, "local_rank": local_rank})
     if args.optimizer == "muon":
@@ -269,13 +271,6 @@ def main():
         )
     else:
         train_config["learning_rate"] = args.learning_rate
-    if args.pretrained_model:
-        train_config.update(
-            {
-                "pretrained_model": args.pretrained_model,
-                "freeze_pretrained": args.freeze_pretrained and not args.no_freeze_pretrained,
-            }
-        )
 
     log("Training configuration", **train_config)
 
@@ -298,7 +293,7 @@ def main():
         direct_answer_gen_weight=args.direct_answer_gen_weight,
         special_token_weight=args.special_token_weight,
         label_smoothing=args.label_smoothing,
-        # New architecture options
+        # Architecture options
         use_causal_encoder=args.use_causal_encoder,
         detach_between_steps=not args.no_detach,
         use_flash_attention=not args.no_flash_attention,
@@ -312,11 +307,42 @@ def main():
         **{f"est_{k}": f"{v:.1f}M" for k, v in params.items()},
     )
 
-    # Initialize tokenizer (use pretrained model's tokenizer if specified)
-    base_tokenizer_model = args.pretrained_model if args.pretrained_model else "gpt2"
-    tokenizer = ToolCallTokenizer(base_model=base_tokenizer_model)
-    config.vocab_size = tokenizer.vocab_size  # Update vocab size
-    log("Tokenizer initialized", base_model=base_tokenizer_model, vocab_size=tokenizer.vocab_size)
+    # Initialize SentencePiece tokenizer
+    # Only main process should train tokenizer in DDP mode
+    tokenizer = SentencePieceTokenizer(vocab_size=args.vocab_size)
+
+    if args.sp_model and os.path.exists(args.sp_model):
+        # Load pre-trained SentencePiece model
+        tokenizer.load(args.sp_model)
+        log("SentencePiece model loaded", path=args.sp_model, vocab_size=tokenizer.vocab_size)
+    else:
+        # Train SentencePiece model from dataset
+        if is_main_process():
+            os.makedirs(args.save_dir, exist_ok=True)
+
+            # Collect all data paths for training
+            data_paths = [args.data_path]
+            if args.eval_path:
+                data_paths.append(args.eval_path)
+
+            log("Training SentencePiece model from dataset...", data_paths=data_paths)
+            sp_model_path = tokenizer.train(
+                data_paths=data_paths,
+                output_dir=args.save_dir,
+                model_prefix="sp_tokenizer",
+                vocab_size=args.vocab_size,
+            )
+            log("SentencePiece model trained", path=sp_model_path, vocab_size=tokenizer.vocab_size)
+
+        # Synchronize in DDP mode - other processes wait and then load
+        if use_ddp:
+            import torch.distributed as dist
+            dist.barrier()
+            if not is_main_process():
+                sp_model_path = os.path.join(args.save_dir, "sp_tokenizer.model")
+                tokenizer.load(sp_model_path)
+
+    config.vocab_size = tokenizer.vocab_size
 
     # Load dataset
     train_dataset = ToolCallDataset(
@@ -500,27 +526,8 @@ def main():
             pin_memory=True if "cuda" in args.device else False,
         )
 
-    # Initialize model
+    # Initialize model (train from scratch, no pretrained weights)
     model = TRMLLM(config)
-
-    # Load pretrained embeddings if specified
-    if args.pretrained_model:
-        freeze = args.freeze_pretrained and not args.no_freeze_pretrained
-        vocab_size, pretrained_hidden_dim = model.load_pretrained_embeddings(
-            args.pretrained_model,
-            freeze=freeze,
-            device=args.device,
-            tokenizer_vocab_size=tokenizer.vocab_size,  # Pass tokenizer vocab size to handle special tokens
-        )
-        # Update config vocab size to match
-        config.vocab_size = vocab_size
-        log(
-            "Pretrained embeddings loaded",
-            model=args.pretrained_model,
-            pretrained_hidden_dim=pretrained_hidden_dim,
-            vocab_size=vocab_size,
-            freeze=freeze,
-        )
 
     actual_params = model.get_num_trainable_params()
     log("Model initialized", trainable_params=f"{actual_params / 1e6:.1f}M")
@@ -572,11 +579,10 @@ def main():
         with open(config_path, "w") as f:
             json.dump(asdict(config), f, indent=2)
 
-        # Save training args (for inference to know pretrained model, etc.)
+        # Save training args (for inference)
         training_args = {
-            "pretrained_model": args.pretrained_model,
-            "freeze_pretrained": args.freeze_pretrained and not args.no_freeze_pretrained,
-            "tokenizer_base_model": base_tokenizer_model,
+            "sp_model": os.path.join(args.save_dir, "sp_tokenizer.model"),
+            "vocab_size": tokenizer.vocab_size,
             "optimizer": args.optimizer,
             "muon_lr": args.muon_lr if args.optimizer == "muon" else None,
             "muon_momentum": args.muon_momentum if args.optimizer == "muon" else None,
@@ -586,6 +592,16 @@ def main():
         training_args_path = os.path.join(args.save_dir, "training_args.json")
         with open(training_args_path, "w") as f:
             json.dump(training_args, f, indent=2)
+
+        # Copy SentencePiece model to save_dir if it was provided externally
+        if args.sp_model and os.path.exists(args.sp_model):
+            sp_dest = os.path.join(args.save_dir, "sp_tokenizer.model")
+            if os.path.abspath(args.sp_model) != os.path.abspath(sp_dest):
+                shutil.copy(args.sp_model, sp_dest)
+                # Also copy vocab file if exists
+                vocab_src = args.sp_model.replace(".model", ".vocab")
+                if os.path.exists(vocab_src):
+                    shutil.copy(vocab_src, os.path.join(args.save_dir, "sp_tokenizer.vocab"))
 
         log(
             "Training artifacts saved",

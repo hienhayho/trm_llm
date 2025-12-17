@@ -15,7 +15,7 @@ import os
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
 from trm_llm.models.trm_llm import TRMLLM
-from trm_llm.data.tokenizer import ToolCallTokenizer
+from trm_llm.data.sp_tokenizer import SentencePieceTokenizer
 from trm_llm.inference.generator import TRMInference
 from trm_llm.utils.config import TRMLLMConfig
 from trm_llm.utils.logger import log, log_warning, log_error
@@ -42,6 +42,12 @@ def parse_args():
         help="Path to config JSON (default: same dir as checkpoint or from checkpoint)",
     )
     parser.add_argument(
+        "--sp_model",
+        type=str,
+        default=None,
+        help="Path to SentencePiece model (default: same dir as checkpoint)",
+    )
+    parser.add_argument(
         "--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu", help="Device"
     )
     parser.add_argument("--analyze", action="store_true", help="Analyze refinement across steps")
@@ -62,7 +68,6 @@ def load_model(checkpoint_path, device, config_path=None):
     Returns:
         model: Loaded TRMLLM model
         config: TRMLLMConfig
-        training_args: Training arguments dict (may contain pretrained_model info)
     """
     log("Loading checkpoint", path=checkpoint_path)
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
@@ -91,14 +96,6 @@ def load_model(checkpoint_path, device, config_path=None):
         else:
             raise ValueError("No config found. Provide --config or ensure config.json exists.")
 
-    # Load training_args.json to check for pretrained model
-    training_args = {}
-    training_args_path = os.path.join(checkpoint_dir, "training_args.json")
-    if os.path.exists(training_args_path):
-        with open(training_args_path, "r") as f:
-            training_args = json.load(f)
-        log("Training args loaded", path=training_args_path)
-
     log("Model configuration",
         config_source=config_source,
         parameters=f"~{config.estimate_parameters()['total_M']:.1f}M",
@@ -108,24 +105,7 @@ def load_model(checkpoint_path, device, config_path=None):
 
     model = TRMLLM(config)
 
-    # If trained with pretrained embeddings, we need to set up the same structure
-    # before loading state dict
-    pretrained_model = training_args.get("pretrained_model")
-    if pretrained_model:
-        log("Setting up pretrained embedding structure", model=pretrained_model)
-        # Initialize tokenizer to get vocab size
-        tokenizer_base = training_args.get("tokenizer_base_model", pretrained_model)
-        tokenizer = ToolCallTokenizer(base_model=tokenizer_base)
-        # Load pretrained embeddings to create the right model structure
-        # freeze=False since we'll load the trained weights anyway
-        model.load_pretrained_embeddings(
-            pretrained_model,
-            freeze=False,
-            device=device,
-            tokenizer_vocab_size=tokenizer.vocab_size,
-        )
-
-    # Now load the trained weights
+    # Load the trained weights
     model.load_state_dict(checkpoint["model_state_dict"])
     log("Model weights loaded")
 
@@ -164,20 +144,32 @@ def default_tools():
 def main():
     args = parse_args()
 
-    # Load training args to get tokenizer info
     checkpoint_dir = os.path.dirname(args.checkpoint)
+
+    # Load training args to get tokenizer info
     training_args_path = os.path.join(checkpoint_dir, "training_args.json")
     training_args = {}
     if os.path.exists(training_args_path):
         with open(training_args_path, "r") as f:
             training_args = json.load(f)
 
-    # Initialize tokenizer with same base model as training
-    tokenizer_base = training_args.get("tokenizer_base_model", "gpt2")
-    tokenizer = ToolCallTokenizer(base_model=tokenizer_base)
-    log("Tokenizer initialized", base_model=tokenizer_base, vocab_size=tokenizer.vocab_size)
+    # Initialize SentencePiece tokenizer
+    sp_model_path = args.sp_model
+    if not sp_model_path:
+        # Try to find in training_args or checkpoint dir
+        sp_model_path = training_args.get("sp_model")
+        if not sp_model_path or not os.path.exists(sp_model_path):
+            sp_model_path = os.path.join(checkpoint_dir, "sp_tokenizer.model")
 
-    # Load model (will use training_args to set up pretrained structure)
+    if not os.path.exists(sp_model_path):
+        log_error("SentencePiece model not found", path=sp_model_path)
+        log_error("Please provide --sp_model or ensure sp_tokenizer.model exists in checkpoint dir")
+        sys.exit(1)
+
+    tokenizer = SentencePieceTokenizer(model_path=sp_model_path)
+    log("Tokenizer initialized", model=sp_model_path, vocab_size=tokenizer.vocab_size)
+
+    # Load model
     model, config = load_model(args.checkpoint, args.device, args.config)
     config.vocab_size = tokenizer.vocab_size
 
@@ -186,7 +178,6 @@ def main():
         tool_mapping_path = args.tool_mapping
     else:
         # Try to find in same directory as checkpoint
-        checkpoint_dir = os.path.dirname(args.checkpoint)
         tool_mapping_path = os.path.join(checkpoint_dir, "tool_mapping.json")
 
     if os.path.exists(tool_mapping_path):
