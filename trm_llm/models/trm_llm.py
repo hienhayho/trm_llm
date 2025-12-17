@@ -61,6 +61,7 @@ class TRMLLM(nn.Module):
             num_heads=config.num_heads,
             ff_dim=config.ff_dim,
             dropout=config.dropout,
+            use_sdp_attention=getattr(config, 'use_flash_attention', True),
         )
 
         # ===== TRM Components =====
@@ -85,6 +86,7 @@ class TRMLLM(nn.Module):
         )
 
         # Unified generation head (for both tool calls and direct answers)
+        # Now cross-attends to full encoder output for better generation
         self.generation_head = UnifiedGenerationHead(
             action_dim=config.action_dim,
             vocab_size=config.vocab_size,
@@ -92,6 +94,7 @@ class TRMLLM(nn.Module):
             num_layers=getattr(config, "generation_num_layers", 3),
             num_heads=getattr(config, "generation_num_heads", 6),
             max_gen_len=config.max_generation_len,
+            encoder_hidden_dim=config.hidden_dim,  # Pass encoder hidden dim for projection
         )
 
         # ===== Learnable Initial State =====
@@ -137,7 +140,9 @@ class TRMLLM(nn.Module):
         x = self.embedding_dropout(x)
 
         # Encode through transformer
-        x_encoded = self.encoder(x)
+        # Use causal attention if configured (for pure LLM training)
+        is_causal = getattr(self.config, 'use_causal_encoder', False)
+        x_encoded = self.encoder(x, is_causal=is_causal)
 
         return x_encoded
 
@@ -207,9 +212,15 @@ class TRMLLM(nn.Module):
             outputs = self.output_heads(y)  # Dict with action_logits, num_calls_logits, halt_logit
 
             # 3d. Generate logits if target provided (only on last step for efficiency)
+            # Pass encoder output for cross-attention (enables attending to all input tokens)
             if step == max_steps - 1 and target_generation_ids is not None:
-                generation_logits = self.generation_head(y, target_ids=target_generation_ids)
+                generation_logits = self.generation_head(
+                    y, target_ids=target_generation_ids, encoder_output=x_encoded
+                )
                 outputs["generation_logits"] = generation_logits
+
+            # Store encoder output for inference generation
+            outputs["encoder_output"] = x_encoded
 
             outputs_per_step.append(outputs)
 
@@ -220,15 +231,17 @@ class TRMLLM(nn.Module):
                     # Generate on early stop too
                     if target_generation_ids is not None and "generation_logits" not in outputs:
                         generation_logits = self.generation_head(
-                            y, target_ids=target_generation_ids
+                            y, target_ids=target_generation_ids, encoder_output=x_encoded
                         )
                         outputs["generation_logits"] = generation_logits
                     break
 
-            # 3f. Detach states for next iteration
+            # 3f. Optionally detach states for next iteration
             # Key TRM technique: don't backprop through all supervision steps
-            # Only the last step will have gradients
-            if step < max_steps - 1:
+            # Only the last step will have gradients (when detaching is enabled)
+            # Set detach_between_steps=False to allow gradients through all steps
+            should_detach = getattr(self.config, 'detach_between_steps', True)
+            if step < max_steps - 1 and should_detach:
                 y = y.detach()
                 z = z.detach()
 
@@ -238,22 +251,35 @@ class TRMLLM(nn.Module):
         self,
         y_state: torch.Tensor,
         max_length: int = 256,
-        temperature: float = 1.0,
+        temperature: float = 0.7,
         eos_token_id: int = None,
+        encoder_output: torch.Tensor = None,
+        repetition_penalty: float = 1.2,
+        top_k: int = 50,
+        top_p: float = 0.9,
+        no_repeat_ngram_size: int = 3,
     ) -> torch.Tensor:
         """Generate tokens from action state
 
         Args:
             y_state: (batch_size, action_dim) - final action state
             max_length: maximum generation length
-            temperature: sampling temperature (1.0 = greedy)
+            temperature: sampling temperature (lower = more deterministic, default 0.7)
             eos_token_id: token ID to stop generation
+            encoder_output: (batch_size, seq_len, hidden_dim) - encoder output for cross-attention
+            repetition_penalty: penalty for repeating tokens (1.0 = no penalty, >1.0 = penalize)
+            top_k: keep only top k tokens for sampling (0 = disabled)
+            top_p: nucleus sampling - keep tokens with cumulative prob < top_p
+            no_repeat_ngram_size: prevent repeating n-grams of this size (0 = disabled)
 
         Returns:
             generated_ids: (batch_size, seq_len) - generated token IDs
         """
         return self.generation_head.generate(
-            y_state, max_length=max_length, temperature=temperature, eos_token_id=eos_token_id
+            y_state, max_length=max_length, temperature=temperature,
+            eos_token_id=eos_token_id, encoder_output=encoder_output,
+            repetition_penalty=repetition_penalty, top_k=top_k,
+            top_p=top_p, no_repeat_ngram_size=no_repeat_ngram_size
         )
 
     def get_num_params(self):
@@ -319,7 +345,7 @@ class TRMLLM(nn.Module):
             # Override forward to use projection
             original_forward = self.generation_head.forward
 
-            def new_forward(y_state, target_ids=None, max_length=None):
+            def new_forward(y_state, target_ids=None, max_length=None, encoder_output=None):
                 if target_ids is not None:
                     # Project pretrained embeddings
                     pretrained_embeds = self.generation_head._pretrained_embed(target_ids)
@@ -328,14 +354,14 @@ class TRMLLM(nn.Module):
                     seq_len = target_ids.size(1)
                     positions = torch.arange(seq_len, device=target_ids.device).unsqueeze(0)
                     tgt = projected_embeds + self.generation_head.position_embedding(positions)
-                    # Continue with decoder
-                    memory = self.generation_head.context_proj(y_state).unsqueeze(1)
+                    # Prepare memory for cross-attention (y_state context + encoder output)
+                    memory = self.generation_head._prepare_memory(y_state, encoder_output)
                     causal_mask = self.generation_head._get_causal_mask(seq_len, target_ids.device)
                     output = self.generation_head.decoder(tgt, memory, tgt_mask=causal_mask)
                     logits = self.generation_head.output_proj(output)
                     return logits
                 else:
-                    return original_forward(y_state, target_ids, max_length)
+                    return original_forward(y_state, target_ids, max_length, encoder_output)
 
             self.generation_head.forward = new_forward
         else:

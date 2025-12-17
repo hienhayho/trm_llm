@@ -84,3 +84,4 @@ Roles: `user`, `tool_call`, `tool_response`, `assistant`
 - `trm_llm/data/tokenizer.py` - GPT-2 based tokenizer with special tokens
 - `trm_llm/data/dataset.py` - Dataset loading and tool-to-ID mapping
 - `trm_llm/inference/generator.py` - TRMInference class for generation
+- always use uv to run python script

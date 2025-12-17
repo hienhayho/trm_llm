@@ -193,6 +193,7 @@ class TRMTrainer:
         tokenizer: Optional[ToolCallTokenizer] = None,
         tool_id_to_name: Optional[Dict[int, str]] = None,
         save_interval: int = 10,
+        log_sample_interval: int = 0,
         optimizer_type: Literal["adamw", "muon"] = "adamw",
         muon_lr: float = 0.02,
         muon_momentum: float = 0.95,
@@ -209,6 +210,7 @@ class TRMTrainer:
             tokenizer: Optional tokenizer for logging sample predictions
             tool_id_to_name: Optional mapping from tool IDs to names
             save_interval: Save checkpoint every N epochs (default: 10)
+            log_sample_interval: Log sample prediction every N steps (0 = only at end of epoch)
             optimizer_type: "adamw" or "muon" (Muon uses AdamW for embeddings/heads)
             muon_lr: Learning rate for Muon hidden weights (default: 0.02)
             muon_momentum: Momentum for Muon (default: 0.95)
@@ -220,6 +222,7 @@ class TRMTrainer:
         self.tokenizer = tokenizer
         self.tool_id_to_name = tool_id_to_name or {}
         self.save_interval = save_interval
+        self.log_sample_interval = log_sample_interval
         self.optimizer_type = optimizer_type
         self.use_ddp = use_ddp
         self.local_rank = local_rank
@@ -429,6 +432,11 @@ class TRMTrainer:
                     }
                 )
 
+            # Log sample prediction at intervals (if enabled)
+            if self.log_sample_interval > 0 and self.global_step % self.log_sample_interval == 0:
+                sample_idx = random.randint(0, len(self.train_loader.dataset) - 1)
+                self.log_sample_prediction(sample_idx=sample_idx, context=f"step {self.global_step}")
+
         # Average metrics
         num_batches = len(self.train_loader)
         avg_metrics = {key: value / num_batches for key, value in total_metrics.items()}
@@ -494,11 +502,12 @@ class TRMTrainer:
         return val_metrics
 
     @torch.no_grad()
-    def log_sample_prediction(self, sample_idx: int = 0):
+    def log_sample_prediction(self, sample_idx: int = 0, context: str = ""):
         """Log a sample prediction to monitor training progress
 
         Args:
             sample_idx: Index of sample to log from training set
+            context: Optional context string (e.g., "step 100", "end of epoch")
         """
         # Only log on main process
         if not self.is_main or self.tokenizer is None:
@@ -576,7 +585,8 @@ class TRMTrainer:
                 gen_text = gen_text[:300] + "..."
             sample_pred["generated"] = gen_text
 
-        log("Sample prediction (end of epoch)", **sample_pred)
+        log_msg = f"Sample prediction ({context})" if context else "Sample prediction"
+        log(log_msg, **sample_pred)
 
         self.model.train()
 
@@ -698,7 +708,7 @@ class TRMTrainer:
 
             # Log sample prediction at end of epoch (random sample, main process only)
             sample_idx = random.randint(0, len(self.train_loader.dataset) - 1)
-            self.log_sample_prediction(sample_idx=sample_idx)
+            self.log_sample_prediction(sample_idx=sample_idx, context=f"epoch {epoch+1} end")
 
             # Save periodic checkpoint (main process only via save_checkpoint)
             if self.save_interval > 0 and (epoch + 1) % self.save_interval == 0:

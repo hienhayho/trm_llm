@@ -52,6 +52,11 @@ class TRMLLMConfig:
     halt_threshold: float = 0.5  # Threshold for early stopping
     halt_loss_weight: float = 0.5  # Weight for halting loss
 
+    # ===== Architecture Options =====
+    use_causal_encoder: bool = False  # Use causal attention in encoder (for pure LLM training)
+    detach_between_steps: bool = True  # Detach states between supervision steps (original TRM behavior)
+    use_flash_attention: bool = True  # Use PyTorch 2.0 SDPA for Flash Attention
+
     # ===== Loss Weights =====
     action_loss_weight: float = 2.0  # Weight for action classification loss (tool_call vs direct_answer)
     tool_call_gen_weight: float = 2.0  # Weight for tool call JSON generation loss (higher = focus more on tool calls)

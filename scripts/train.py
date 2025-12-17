@@ -141,6 +141,23 @@ def parse_args():
         help="Label smoothing for generation loss (default: 0.1, 0.0 = no smoothing)",
     )
 
+    # Architecture options (new)
+    parser.add_argument(
+        "--use_causal_encoder",
+        action="store_true",
+        help="Use causal attention in encoder (default: False, bidirectional)",
+    )
+    parser.add_argument(
+        "--no_detach",
+        action="store_true",
+        help="Disable state detaching between supervision steps (allows gradients through all steps)",
+    )
+    parser.add_argument(
+        "--no_flash_attention",
+        action="store_true",
+        help="Disable Flash Attention (use standard nn.MultiheadAttention)",
+    )
+
     # System
     parser.add_argument(
         "--device",
@@ -159,6 +176,12 @@ def parse_args():
         type=int,
         default=10,
         help="Save checkpoint every N epochs (default: 10, 0 to disable)",
+    )
+    parser.add_argument(
+        "--log_sample_interval",
+        type=int,
+        default=0,
+        help="Log sample prediction every N steps (default: 0 = only at end of epoch)",
     )
     parser.add_argument(
         "--resume", type=str, default=None, help="Path to checkpoint to resume from"
@@ -275,6 +298,10 @@ def main():
         direct_answer_gen_weight=args.direct_answer_gen_weight,
         special_token_weight=args.special_token_weight,
         label_smoothing=args.label_smoothing,
+        # New architecture options
+        use_causal_encoder=args.use_causal_encoder,
+        detach_between_steps=not args.no_detach,
+        use_flash_attention=not args.no_flash_attention,
     )
 
     # Print estimated parameters
@@ -515,6 +542,7 @@ def main():
         tokenizer=tokenizer,
         tool_id_to_name=tool_id_to_name,
         save_interval=args.save_interval,
+        log_sample_interval=args.log_sample_interval,
         optimizer_type=args.optimizer,
         muon_lr=args.muon_lr,
         muon_momentum=args.muon_momentum,

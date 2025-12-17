@@ -62,9 +62,12 @@ def load_model(checkpoint_path, device, config_path=None):
     Returns:
         model: Loaded TRMLLM model
         config: TRMLLMConfig
+        training_args: Training arguments dict (may contain pretrained_model info)
     """
     log("Loading checkpoint", path=checkpoint_path)
     checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+
+    checkpoint_dir = os.path.dirname(checkpoint_path)
 
     # Load config from JSON file if provided, otherwise from checkpoint
     config = None
@@ -76,7 +79,6 @@ def load_model(checkpoint_path, device, config_path=None):
         config_source = config_path
     else:
         # Try to find config.json in same dir as checkpoint
-        checkpoint_dir = os.path.dirname(checkpoint_path)
         default_config_path = os.path.join(checkpoint_dir, "config.json")
         if os.path.exists(default_config_path):
             with open(default_config_path, "r") as f:
@@ -89,6 +91,14 @@ def load_model(checkpoint_path, device, config_path=None):
         else:
             raise ValueError("No config found. Provide --config or ensure config.json exists.")
 
+    # Load training_args.json to check for pretrained model
+    training_args = {}
+    training_args_path = os.path.join(checkpoint_dir, "training_args.json")
+    if os.path.exists(training_args_path):
+        with open(training_args_path, "r") as f:
+            training_args = json.load(f)
+        log("Training args loaded", path=training_args_path)
+
     log("Model configuration",
         config_source=config_source,
         parameters=f"~{config.estimate_parameters()['total_M']:.1f}M",
@@ -97,8 +107,27 @@ def load_model(checkpoint_path, device, config_path=None):
         max_supervision_steps=config.max_supervision_steps)
 
     model = TRMLLM(config)
+
+    # If trained with pretrained embeddings, we need to set up the same structure
+    # before loading state dict
+    pretrained_model = training_args.get("pretrained_model")
+    if pretrained_model:
+        log("Setting up pretrained embedding structure", model=pretrained_model)
+        # Initialize tokenizer to get vocab size
+        tokenizer_base = training_args.get("tokenizer_base_model", pretrained_model)
+        tokenizer = ToolCallTokenizer(base_model=tokenizer_base)
+        # Load pretrained embeddings to create the right model structure
+        # freeze=False since we'll load the trained weights anyway
+        model.load_pretrained_embeddings(
+            pretrained_model,
+            freeze=False,
+            device=device,
+            tokenizer_vocab_size=tokenizer.vocab_size,
+        )
+
+    # Now load the trained weights
     model.load_state_dict(checkpoint["model_state_dict"])
-    log("Model loaded", architecture=str(model))
+    log("Model weights loaded")
 
     metrics = checkpoint.get("metrics", {})
     if metrics:
@@ -135,11 +164,21 @@ def default_tools():
 def main():
     args = parse_args()
 
-    # Load model
-    model, config = load_model(args.checkpoint, args.device, args.config)
+    # Load training args to get tokenizer info
+    checkpoint_dir = os.path.dirname(args.checkpoint)
+    training_args_path = os.path.join(checkpoint_dir, "training_args.json")
+    training_args = {}
+    if os.path.exists(training_args_path):
+        with open(training_args_path, "r") as f:
+            training_args = json.load(f)
 
-    # Initialize tokenizer
-    tokenizer = ToolCallTokenizer()
+    # Initialize tokenizer with same base model as training
+    tokenizer_base = training_args.get("tokenizer_base_model", "gpt2")
+    tokenizer = ToolCallTokenizer(base_model=tokenizer_base)
+    log("Tokenizer initialized", base_model=tokenizer_base, vocab_size=tokenizer.vocab_size)
+
+    # Load model (will use training_args to set up pretrained structure)
+    model, config = load_model(args.checkpoint, args.device, args.config)
     config.vocab_size = tokenizer.vocab_size
 
     # Load tool mapping

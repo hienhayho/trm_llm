@@ -6,6 +6,77 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+class SDPAttention(nn.Module):
+    """Multi-head attention using PyTorch 2.0 Scaled Dot Product Attention
+
+    This automatically uses Flash Attention when available on CUDA,
+    providing significant speedup and memory savings for long sequences.
+    """
+
+    def __init__(self, hidden_dim: int, num_heads: int, dropout: float = 0.1):
+        super().__init__()
+        assert hidden_dim % num_heads == 0, "hidden_dim must be divisible by num_heads"
+
+        self.hidden_dim = hidden_dim
+        self.num_heads = num_heads
+        self.head_dim = hidden_dim // num_heads
+        self.dropout = dropout
+
+        # QKV projection
+        self.qkv_proj = nn.Linear(hidden_dim, 3 * hidden_dim, bias=False)
+        # Output projection
+        self.out_proj = nn.Linear(hidden_dim, hidden_dim, bias=False)
+
+    def forward(self, x: torch.Tensor, attention_mask: torch.Tensor = None,
+                is_causal: bool = False) -> torch.Tensor:
+        """
+        Args:
+            x: (batch_size, seq_len, hidden_dim)
+            attention_mask: (batch_size, seq_len) or (seq_len, seq_len) attention mask
+            is_causal: whether to apply causal masking
+
+        Returns:
+            output: (batch_size, seq_len, hidden_dim)
+        """
+        batch_size, seq_len, _ = x.shape
+
+        # Compute Q, K, V
+        qkv = self.qkv_proj(x)  # (batch, seq, 3 * hidden)
+        qkv = qkv.reshape(batch_size, seq_len, 3, self.num_heads, self.head_dim)
+        qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, batch, heads, seq, head_dim)
+        q, k, v = qkv[0], qkv[1], qkv[2]  # Each: (batch, heads, seq, head_dim)
+
+        # Use PyTorch's scaled_dot_product_attention (enables Flash Attention)
+        # This automatically selects the best backend (Flash, Memory-Efficient, or Math)
+        dropout_p = self.dropout if self.training else 0.0
+
+        # Convert attention_mask if provided
+        attn_mask = None
+        if attention_mask is not None and not is_causal:
+            # If mask is (batch, seq), convert to (batch, 1, 1, seq) for broadcasting
+            if attention_mask.dim() == 2:
+                attn_mask = attention_mask.unsqueeze(1).unsqueeze(2)
+                attn_mask = attn_mask.masked_fill(attn_mask == 0, float('-inf'))
+                attn_mask = attn_mask.masked_fill(attn_mask == 1, 0.0)
+            else:
+                attn_mask = attention_mask
+
+        # SDPA with automatic backend selection
+        output = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=attn_mask,
+            dropout_p=dropout_p,
+            is_causal=is_causal
+        )  # (batch, heads, seq, head_dim)
+
+        # Reshape and project
+        output = output.transpose(1, 2).contiguous()  # (batch, seq, heads, head_dim)
+        output = output.reshape(batch_size, seq_len, self.hidden_dim)
+        output = self.out_proj(output)
+
+        return output
+
+
 class RMSNorm(nn.Module):
     """Root Mean Square Layer Normalization
 
@@ -27,24 +98,34 @@ class RMSNorm(nn.Module):
 class TransformerBlock(nn.Module):
     """Single Transformer block with self-attention and feed-forward
 
-    Standard transformer block used in encoder
+    Standard transformer block used in encoder.
+    Uses SDPAttention for automatic Flash Attention support on PyTorch 2.0+.
     """
 
-    def __init__(self, hidden_dim: int, num_heads: int, ff_dim: int, dropout: float = 0.1):
+    def __init__(self, hidden_dim: int, num_heads: int, ff_dim: int, dropout: float = 0.1,
+                 use_sdp_attention: bool = True):
         super().__init__()
         self.hidden_dim = hidden_dim
         self.num_heads = num_heads
+        self.use_sdp_attention = use_sdp_attention
 
         # Pre-attention norm
         self.norm1 = RMSNorm(hidden_dim)
 
-        # Multi-head self-attention
-        self.attention = nn.MultiheadAttention(
-            embed_dim=hidden_dim,
-            num_heads=num_heads,
-            dropout=dropout,
-            batch_first=True,  # Expect (batch, seq, dim)
-        )
+        # Multi-head self-attention (SDP or standard)
+        if use_sdp_attention:
+            self.attention = SDPAttention(
+                hidden_dim=hidden_dim,
+                num_heads=num_heads,
+                dropout=dropout,
+            )
+        else:
+            self.attention = nn.MultiheadAttention(
+                embed_dim=hidden_dim,
+                num_heads=num_heads,
+                dropout=dropout,
+                batch_first=True,
+            )
 
         # Pre-FFN norm
         self.norm2 = RMSNorm(hidden_dim)
@@ -68,11 +149,14 @@ class TransformerBlock(nn.Module):
         residual = x
         x = self.norm1(x)
 
-        attn_output, _ = self.attention(
-            x, x, x,
-            attn_mask=attention_mask,
-            is_causal=is_causal,
-        )
+        if self.use_sdp_attention:
+            attn_output = self.attention(x, attention_mask=attention_mask, is_causal=is_causal)
+        else:
+            attn_output, _ = self.attention(
+                x, x, x,
+                attn_mask=attention_mask,
+                is_causal=is_causal,
+            )
         x = residual + self.dropout(attn_output)
 
         # Feed-forward with residual
@@ -104,13 +188,15 @@ class SwiGLU(nn.Module):
 class TransformerEncoder(nn.Module):
     """Stack of Transformer blocks
 
-    Standard transformer encoder used for encoding input sequences
+    Standard transformer encoder used for encoding input sequences.
+    Uses SDPAttention by default for Flash Attention support.
     """
 
-    def __init__(self, hidden_dim: int, num_layers: int, num_heads: int, ff_dim: int, dropout: float = 0.1):
+    def __init__(self, hidden_dim: int, num_layers: int, num_heads: int, ff_dim: int,
+                 dropout: float = 0.1, use_sdp_attention: bool = True):
         super().__init__()
         self.layers = nn.ModuleList([
-            TransformerBlock(hidden_dim, num_heads, ff_dim, dropout)
+            TransformerBlock(hidden_dim, num_heads, ff_dim, dropout, use_sdp_attention)
             for _ in range(num_layers)
         ])
         self.final_norm = RMSNorm(hidden_dim)
@@ -164,17 +250,19 @@ class TinyTransformer(nn.Module):
     """Small 2-layer transformer for recursive modules
 
     Used in RecursiveReasoningModule and ActionStateModule
-    Following TRM principle: small recursive networks instead of huge ones
+    Following TRM principle: small recursive networks instead of huge ones.
+    Uses SDPAttention by default for Flash Attention support.
     """
 
-    def __init__(self, dim: int, num_layers: int = 2, num_heads: int = 8, dropout: float = 0.1):
+    def __init__(self, dim: int, num_layers: int = 2, num_heads: int = 8, dropout: float = 0.1,
+                 use_sdp_attention: bool = True):
         super().__init__()
         assert num_layers <= 4, "TinyTransformer should have <= 4 layers (TRM principle)"
 
         ff_dim = dim * 4  # Standard 4x expansion
 
         self.layers = nn.ModuleList([
-            TransformerBlock(dim, num_heads, ff_dim, dropout)
+            TransformerBlock(dim, num_heads, ff_dim, dropout, use_sdp_attention)
             for _ in range(num_layers)
         ])
         self.norm = RMSNorm(dim)
