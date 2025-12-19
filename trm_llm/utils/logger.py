@@ -1,7 +1,7 @@
 """Global logger for TRM-LLM using structlog
 
 Provides rank-aware logging that only outputs on the main process (rank 0)
-when running with DDP (Distributed Data Parallel).
+when running with DDP (Distributed Data Parallel) or DeepSpeed.
 
 Usage:
     from trm_llm.utils.logger import log
@@ -10,6 +10,7 @@ Usage:
 """
 
 import logging
+import os
 import sys
 import structlog
 import torch.distributed as dist
@@ -27,6 +28,9 @@ def is_main_process() -> bool:
     Returns True if:
     - Not using distributed training
     - Using distributed training and rank == 0
+
+    Also checks environment variables (RANK, LOCAL_RANK) for DeepSpeed
+    which may set these before dist.init_process_group is called.
     """
     global _is_main_process
 
@@ -34,11 +38,22 @@ def is_main_process() -> bool:
     if _is_main_process is not None:
         return _is_main_process
 
-    # Check distributed state
-    if not dist.is_initialized():
-        _is_main_process = True
-    else:
+    # Check distributed state first
+    if dist.is_initialized():
         _is_main_process = dist.get_rank() == 0
+        return _is_main_process
+
+    # Check environment variables (for DeepSpeed/torchrun before dist init)
+    rank_env = os.environ.get("RANK")
+    local_rank_env = os.environ.get("LOCAL_RANK")
+
+    if rank_env is not None:
+        _is_main_process = int(rank_env) == 0
+    elif local_rank_env is not None:
+        _is_main_process = int(local_rank_env) == 0
+    else:
+        # No distributed training detected
+        _is_main_process = True
 
     return _is_main_process
 

@@ -1,0 +1,58 @@
+[
+  {
+    "type": "function",
+    "function": {
+      "name": "get_product_price",
+      "description": "Lấy thông tin về giá của sản phẩm dựa trên tên sản phẩm mà khách hàng cung cấp.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "product": {
+            "type": "string",
+            "description": "Tên sản phẩm"
+          },
+          "address": {
+            "type": "string",
+            "description": "Địa chỉ của khách hàng để xác định giá sản phẩm theo vùng miền"
+          }
+        },
+        "required": [
+          "product",
+          "address"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "describe_product",
+      "description": "Mô tả thông tin về sản phẩm dựa trên tên sản phẩm mà khách hàng cung cấp.",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "product": {
+            "type": "string",
+            "description": "Tên sản phẩm có liên quan đến Internet, Camera hoặc Truyền hình"
+          }
+        },
+        "required": [
+          "product"
+        ]
+      }
+    }
+  },
+  {
+    "type": "function",
+    "function": {
+      "name": "request_agent",
+      "description": "Liên hệ nhân viên chăm sóc",
+      "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "optional": []
+      }
+    }
+  }
+]

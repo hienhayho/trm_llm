@@ -155,7 +155,8 @@ class RecursiveReasoningModule(nn.Module):
 
         # Initialize z if not provided
         if z_current is None:
-            z = torch.zeros(batch_size, self.reasoning_dim, device=x_encoded.device)
+            # Use same dtype as input to support FP16/DeepSpeed
+            z = torch.zeros(batch_size, self.reasoning_dim, device=x_encoded.device, dtype=x_encoded.dtype)
         else:
             z = z_current
 
@@ -223,7 +224,8 @@ class RecursiveReasoningWithSequence(nn.Module):
 
         # Initialize z
         if z_current is None:
-            z = torch.zeros(batch_size, seq_len, self.reasoning_dim, device=x_encoded.device)
+            # Use same dtype as input to support FP16/DeepSpeed
+            z = torch.zeros(batch_size, seq_len, self.reasoning_dim, device=x_encoded.device, dtype=x_encoded.dtype)
         else:
             z = z_current
 

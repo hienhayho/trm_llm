@@ -4,9 +4,10 @@ Implements training loop with:
 - Deep supervision (multi-step training)
 - Curriculum learning (gradually increase supervision steps)
 - Adaptive computation time (ACT) for efficient training
-- Gradient clipping and EMA (future)
+- Gradient clipping and EMA for stable recursive depth
 - Muon optimizer support for faster convergence
 - DDP (Distributed Data Parallel) for multi-GPU training
+- DeepSpeed support for memory-efficient training with ZeRO optimization
 """
 
 from typing import Tuple
@@ -18,8 +19,9 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from tqdm import tqdm
-from typing import Optional, Dict, Literal
+from typing import Optional, Dict, Literal, Any
 import os
+import json
 
 from trm_llm.utils.config import TRMLLMConfig
 from trm_llm.data.tokenizer import ToolCallTokenizer
@@ -30,6 +32,110 @@ from trm_llm.training.loss import (
     compute_per_step_accuracy,
     compute_valid_tool_call_format_accuracy,
 )
+
+
+class EMAModel:
+    """Exponential Moving Average of model parameters
+
+    Maintains a shadow copy of model parameters that is updated as:
+        ema_param = decay * ema_param + (1 - decay) * param
+
+    Benefits for TRM-LLM:
+    - Stabilizes recursive reasoning by smoothing parameter updates
+    - The same reasoning network f(x,y,z) is applied n times recursively
+    - EMA ensures consistent behavior across recursion depths
+    - Improves generalization on validation/test sets
+
+    Usage:
+        ema = EMAModel(model, decay=0.9999)
+        for batch in dataloader:
+            loss = model(batch)
+            loss.backward()
+            optimizer.step()
+            ema.update()  # Update EMA after each step
+
+        # For evaluation, use EMA weights
+        ema.apply_shadow()
+        evaluate(model)
+        ema.restore()  # Restore original weights for training
+    """
+
+    def __init__(
+        self,
+        model: nn.Module,
+        decay: float = 0.9999,
+        device: Optional[str] = None,
+    ):
+        """
+        Args:
+            model: Model to track (can be DDP-wrapped or raw)
+            decay: EMA decay rate (higher = slower updates, more smoothing)
+                   Typical values: 0.999, 0.9999, 0.99999
+            device: Device for EMA parameters (default: same as model)
+        """
+        self.decay = decay
+        self.device = device
+
+        # Get raw model (unwrap DDP if needed)
+        if hasattr(model, 'module'):
+            self.model = model.module
+        else:
+            self.model = model
+
+        # Create shadow parameters (EMA copy)
+        self.shadow = {}
+        self.backup = {}  # For storing original params during eval
+
+        for name, param in self.model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.clone()
+                if device:
+                    self.shadow[name] = self.shadow[name].to(device)
+
+    @torch.no_grad()
+    def update(self):
+        """Update EMA parameters after a training step"""
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and name in self.shadow:
+                # EMA update: shadow = decay * shadow + (1 - decay) * param
+                self.shadow[name].mul_(self.decay).add_(
+                    param.data, alpha=1 - self.decay
+                )
+
+    def apply_shadow(self):
+        """Apply EMA weights to model (for evaluation)
+
+        Saves original weights to backup so they can be restored.
+        """
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and name in self.shadow:
+                self.backup[name] = param.data.clone()
+                param.data.copy_(self.shadow[name])
+
+    def restore(self):
+        """Restore original weights after evaluation"""
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and name in self.backup:
+                param.data.copy_(self.backup[name])
+        self.backup = {}
+
+    def state_dict(self) -> Dict[str, torch.Tensor]:
+        """Get EMA state dict for checkpointing"""
+        return {
+            'shadow': self.shadow.copy(),
+            'decay': self.decay,
+        }
+
+    def load_state_dict(self, state_dict: Dict):
+        """Load EMA state from checkpoint"""
+        self.shadow = state_dict['shadow']
+        self.decay = state_dict.get('decay', self.decay)
+
+    def copy_to_model(self):
+        """Permanently copy EMA weights to model (for final model saving)"""
+        for name, param in self.model.named_parameters():
+            if param.requires_grad and name in self.shadow:
+                param.data.copy_(self.shadow[name])
 
 
 def setup_distributed(rank: int = None, world_size: int = None, backend: str = "nccl"):
@@ -186,6 +292,258 @@ def create_muon_optimizer(
     return MuonWithAuxAdam(param_groups)
 
 
+def create_pytorch_muon_optimizer(
+    model: nn.Module,
+    muon_lr: float = 0.02,
+    adam_lr: float = 3e-4,
+    weight_decay: float = 0.01,
+    muon_momentum: float = 0.95,
+) -> "MuonAdamW":
+    """Create unified Muon+AdamW optimizer for DeepSpeed compatibility
+
+    Uses PyTorch's torch.optim.Muon algorithm for 2D hidden layer weights and
+    AdamW algorithm for all other parameters, implemented in a single optimizer
+    for DeepSpeed ZeRO-2 compatibility.
+
+    Args:
+        model: TRMLLM model
+        muon_lr: Learning rate for Muon (hidden weights)
+        adam_lr: Learning rate for AdamW (embeddings, heads, biases)
+        weight_decay: Weight decay for both optimizers
+        muon_momentum: Momentum for Muon
+
+    Returns:
+        MuonAdamW optimizer compatible with DeepSpeed
+    """
+    # Categorize parameters: Muon only supports 2D params
+    muon_params = []  # For Muon (2D hidden weights only)
+    adamw_params = []  # For AdamW (everything else)
+
+    for name, param in model.named_parameters():
+        if not param.requires_grad:
+            continue
+
+        # Use Muon for 2D weights in encoder, reasoning, and action modules
+        is_hidden_module = any(
+            mod in name
+            for mod in [
+                "encoder",
+                "reasoning_module",
+                "action_module",
+            ]
+        )
+
+        # Muon requires exactly 2D params
+        if is_hidden_module and param.ndim == 2:
+            muon_params.append(param)
+        else:
+            adamw_params.append(param)
+
+    log(
+        "PyTorch Muon optimizer parameter groups",
+        muon_2d_weights=f"{sum(p.numel() for p in muon_params) / 1e6:.2f}M params",
+        adamw_other=f"{sum(p.numel() for p in adamw_params) / 1e6:.2f}M params",
+    )
+
+    # Create unified optimizer with both param groups
+    param_groups = [
+        {
+            "params": muon_params,
+            "lr": muon_lr,
+            "weight_decay": weight_decay,
+            "momentum": muon_momentum,
+            "use_muon": True,
+        },
+        {
+            "params": adamw_params,
+            "lr": adam_lr,
+            "betas": (0.9, 0.95),
+            "weight_decay": weight_decay,
+            "use_muon": False,
+        },
+    ]
+
+    return MuonAdamW(param_groups)
+
+
+class MuonAdamW(torch.optim.Optimizer):
+    """Unified optimizer that applies Muon to 2D weights and AdamW to others
+
+    This is a single optimizer class that implements both Muon and AdamW
+    update rules based on the `use_muon` flag in param groups.
+    Compatible with DeepSpeed ZeRO optimization.
+
+    Muon algorithm (for 2D params):
+    - Uses momentum with Newton-Schulz orthogonalization
+    - Specifically designed for hidden layer weights
+
+    AdamW algorithm (for other params):
+    - Standard Adam with decoupled weight decay
+    - Used for embeddings, biases, and output heads
+    """
+
+    def __init__(self, params, lr=1e-3, betas=(0.9, 0.95), weight_decay=0.01,
+                 momentum=0.95, nesterov=True, ns_steps=5, eps=1e-8):
+        defaults = dict(
+            lr=lr,
+            betas=betas,
+            weight_decay=weight_decay,
+            momentum=momentum,
+            nesterov=nesterov,
+            ns_steps=ns_steps,
+            eps=eps,
+            use_muon=False,
+        )
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        """Perform optimization step
+
+        Applies Muon update to param groups with use_muon=True,
+        AdamW update to others.
+        """
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            if group.get("use_muon", False):
+                self._muon_step(group)
+            else:
+                self._adamw_step(group)
+
+        return loss
+
+    def _muon_step(self, group):
+        """Muon update step for 2D parameters"""
+        momentum = group["momentum"]
+        nesterov = group.get("nesterov", True)
+        ns_steps = group.get("ns_steps", 5)
+        lr = group["lr"]
+        weight_decay = group["weight_decay"]
+
+        for p in group["params"]:
+            if p.grad is None:
+                continue
+
+            grad = p.grad
+            if grad.is_sparse:
+                raise RuntimeError("Muon does not support sparse gradients")
+
+            state = self.state[p]
+
+            # Initialize state
+            if len(state) == 0:
+                state["momentum_buffer"] = torch.zeros_like(p)
+
+            buf = state["momentum_buffer"]
+
+            # Momentum update
+            buf.lerp_(grad, 1 - momentum)
+
+            # Apply Nesterov momentum if enabled
+            if nesterov:
+                g = grad.lerp(buf, momentum)
+            else:
+                g = buf
+
+            # Newton-Schulz orthogonalization (core Muon innovation)
+            # Only for 2D tensors
+            if p.ndim == 2:
+                g = self._newton_schulz(g, ns_steps)
+
+                # Scale learning rate by matrix dimensions for consistent RMS
+                # This ensures similar update magnitudes regardless of layer size
+                scale = max(1, p.size(0) / p.size(1)) ** 0.5
+                adjusted_lr = lr * scale
+            else:
+                adjusted_lr = lr
+
+            # Decoupled weight decay
+            if weight_decay != 0:
+                p.mul_(1 - lr * weight_decay)
+
+            # Parameter update
+            p.add_(g, alpha=-adjusted_lr)
+
+    def _newton_schulz(self, G, steps=5):
+        """Newton-Schulz iteration for approximate matrix orthogonalization
+
+        This is the key innovation of Muon - it orthogonalizes the gradient
+        update direction, which helps with optimization landscape navigation.
+        """
+        # Coefficients from Muon paper
+        a, b, c = 3.4445, -4.7750, 2.0315
+
+        # Work in bfloat16 for efficiency
+        orig_dtype = G.dtype
+        G = G.to(torch.bfloat16)
+
+        # Normalize
+        G = G / (G.norm() + 1e-7)
+
+        # Newton-Schulz iterations
+        for _ in range(steps):
+            A = G @ G.T
+            B = b * A + c * A @ A
+            G = a * G + B @ G
+
+        return G.to(orig_dtype)
+
+    def _adamw_step(self, group):
+        """AdamW update step for non-2D parameters"""
+        lr = group["lr"]
+        betas = group.get("betas", (0.9, 0.95))
+        weight_decay = group["weight_decay"]
+        eps = group.get("eps", 1e-8)
+
+        beta1, beta2 = betas
+
+        for p in group["params"]:
+            if p.grad is None:
+                continue
+
+            grad = p.grad
+            if grad.is_sparse:
+                raise RuntimeError("AdamW does not support sparse gradients")
+
+            state = self.state[p]
+
+            # Initialize state
+            if len(state) == 0:
+                state["step"] = 0
+                state["exp_avg"] = torch.zeros_like(p)
+                state["exp_avg_sq"] = torch.zeros_like(p)
+
+            exp_avg, exp_avg_sq = state["exp_avg"], state["exp_avg_sq"]
+            state["step"] += 1
+            step = state["step"]
+
+            # Decoupled weight decay
+            if weight_decay != 0:
+                p.mul_(1 - lr * weight_decay)
+
+            # Update biased first moment estimate
+            exp_avg.lerp_(grad, 1 - beta1)
+
+            # Update biased second raw moment estimate
+            exp_avg_sq.mul_(beta2).addcmul_(grad, grad, value=1 - beta2)
+
+            # Bias correction
+            bias_correction1 = 1 - beta1 ** step
+            bias_correction2 = 1 - beta2 ** step
+
+            # Compute step size
+            step_size = lr / bias_correction1
+            bias_correction2_sqrt = bias_correction2 ** 0.5
+
+            # Update parameters
+            denom = (exp_avg_sq.sqrt() / bias_correction2_sqrt).add_(eps)
+            p.addcdiv_(exp_avg, denom, value=-step_size)
+
+
 class TRMTrainer:
     """Trainer for TRM-LLM with deep supervision
 
@@ -195,6 +553,8 @@ class TRMTrainer:
     3. State detaching: Gradients only flow through last step
     4. Muon optimizer support for faster convergence on hidden layers
     5. DDP (Distributed Data Parallel) for multi-GPU training
+    6. DeepSpeed support for memory-efficient training with ZeRO optimization
+    7. EMA (Exponential Moving Average) for stable recursive depth
     """
 
     def __init__(
@@ -213,6 +573,10 @@ class TRMTrainer:
         muon_momentum: float = 0.95,
         use_ddp: bool = False,
         local_rank: int = 0,
+        use_deepspeed: bool = False,
+        ds_config: Optional[Dict[str, Any]] = None,
+        use_ema: bool = False,
+        ema_decay: float = 0.9999,
     ):
         """
         Args:
@@ -230,6 +594,10 @@ class TRMTrainer:
             muon_momentum: Momentum for Muon (default: 0.95)
             use_ddp: Whether to use Distributed Data Parallel
             local_rank: Local rank for DDP (GPU device index)
+            use_deepspeed: Whether to use DeepSpeed for training
+            ds_config: DeepSpeed configuration dict (or path to config file)
+            use_ema: Whether to use EMA for stable recursive depth (default: False)
+            ema_decay: EMA decay rate (default: 0.9999, higher = more smoothing)
         """
         self.config = config
         self.device = device
@@ -240,6 +608,10 @@ class TRMTrainer:
         self.optimizer_type = optimizer_type
         self.use_ddp = use_ddp
         self.local_rank = local_rank
+        self.use_deepspeed = use_deepspeed
+        self.ds_config = ds_config
+        self.use_ema = use_ema
+        self.ema_decay = ema_decay
 
         # Get special token IDs for weighted loss (e.g., <tool_call>, </tool_call>)
         self.special_token_ids = []
@@ -263,8 +635,96 @@ class TRMTrainer:
             special_token_ids=self.special_token_ids,
             tool_call_token_id=self.tool_call_token_id,
         )
-        # DDP setup
-        if use_ddp:
+
+        self.train_loader = train_loader
+        self.val_loader = val_loader
+
+        # DeepSpeed setup (takes priority over DDP)
+        if use_deepspeed:
+            import deepspeed
+
+            self.rank = int(os.environ.get("LOCAL_RANK", local_rank))
+            self.world_size = int(os.environ.get("WORLD_SIZE", 1))
+            self.is_main = self.rank == 0
+
+            # Prepare DeepSpeed config
+            if ds_config is None:
+                ds_config = self._get_default_ds_config()
+            elif isinstance(ds_config, str):
+                # Load from file
+                with open(ds_config, "r") as f:
+                    ds_config = json.load(f)
+
+            # Set auto values in config
+            ds_config["train_micro_batch_size_per_gpu"] = config.batch_size
+            ds_config["gradient_clipping"] = config.gradient_clip_norm
+
+            # Get ZeRO stage from config
+            zero_stage = ds_config.get("zero_optimization", {}).get("stage", 0)
+
+            # Create optimizer for DeepSpeed
+            # Muon is now supported with ZeRO-2 (PyTorch 2.9+)
+            if optimizer_type == "muon" and zero_stage == 2:
+                self._log_struct(
+                    "Using PyTorch Muon optimizer with DeepSpeed ZeRO-2",
+                    muon_lr=muon_lr,
+                    adam_lr=config.learning_rate,
+                    momentum=muon_momentum,
+                    zero_stage=zero_stage,
+                )
+                optimizer = create_pytorch_muon_optimizer(
+                    model,
+                    muon_lr=muon_lr,
+                    adam_lr=config.learning_rate,
+                    weight_decay=config.weight_decay,
+                    muon_momentum=muon_momentum,
+                )
+            elif optimizer_type == "muon":
+                # Muon only supported with ZeRO-2
+                log_warning(
+                    "Muon optimizer is only compatible with DeepSpeed ZeRO-2. Falling back to AdamW.",
+                    requested_optimizer=optimizer_type,
+                    using_optimizer="adamw",
+                    zero_stage=zero_stage,
+                )
+                optimizer = torch.optim.AdamW(
+                    model.parameters(),
+                    lr=config.learning_rate,
+                    weight_decay=config.weight_decay,
+                    betas=(0.9, 0.95),
+                )
+            else:
+                self._log_struct(
+                    "Using AdamW optimizer with DeepSpeed",
+                    lr=config.learning_rate,
+                    weight_decay=config.weight_decay,
+                    zero_stage=zero_stage,
+                )
+                optimizer = torch.optim.AdamW(
+                    model.parameters(),
+                    lr=config.learning_rate,
+                    weight_decay=config.weight_decay,
+                    betas=(0.9, 0.95),
+                )
+
+            # Initialize DeepSpeed
+            self.model, self.optimizer, _, self.scheduler = deepspeed.initialize(
+                model=model,
+                optimizer=optimizer,
+                config=ds_config,
+                model_parameters=model.parameters(),
+            )
+            self.raw_model = self.model.module
+            self._log_struct(
+                "DeepSpeed initialized",
+                rank=self.rank,
+                world_size=self.world_size,
+                zero_stage=zero_stage,
+                optimizer=optimizer_type if optimizer_type == "muon" and zero_stage == 2 else "adamw",
+            )
+
+        # DDP setup (if not using DeepSpeed)
+        elif use_ddp:
             self.rank = dist.get_rank() if dist.is_initialized() else 0
             self.world_size = dist.get_world_size() if dist.is_initialized() else 1
             self.is_main = self.rank == 0
@@ -278,47 +738,74 @@ class TRMTrainer:
                 output_device=local_rank,
                 find_unused_parameters=True,
             )
+            self.raw_model = self.model.module
             self._log_struct("DDP initialized", rank=self.rank, world_size=self.world_size)
+
+            # Optimizer (use raw model for parameter groups)
+            if optimizer_type == "muon":
+                self._log_struct(
+                    "Using Muon optimizer",
+                    muon_lr=muon_lr,
+                    adam_lr=config.learning_rate,
+                    momentum=muon_momentum,
+                )
+                self.optimizer = create_muon_optimizer(
+                    self.raw_model,
+                    muon_lr=muon_lr,
+                    adam_lr=config.learning_rate,
+                    weight_decay=config.weight_decay,
+                    muon_momentum=muon_momentum,
+                )
+            else:
+                self._log_struct(
+                    "Using AdamW optimizer", lr=config.learning_rate, weight_decay=config.weight_decay
+                )
+                self.optimizer = torch.optim.AdamW(
+                    self.raw_model.parameters(),
+                    lr=config.learning_rate,
+                    weight_decay=config.weight_decay,
+                    betas=(0.9, 0.95),  # Standard for transformers
+                )
+
+            # Learning rate scheduler (warmup + cosine decay)
+            self.scheduler = self._create_scheduler()
+
+        # Single GPU / CPU setup
         else:
             self.rank = 0
             self.world_size = 1
             self.is_main = True
             self.model = model.to(device)
+            self.raw_model = self.model
 
-        self.train_loader = train_loader
-        self.val_loader = val_loader
+            # Optimizer (use raw model for parameter groups)
+            if optimizer_type == "muon":
+                self._log_struct(
+                    "Using Muon optimizer",
+                    muon_lr=muon_lr,
+                    adam_lr=config.learning_rate,
+                    momentum=muon_momentum,
+                )
+                self.optimizer = create_muon_optimizer(
+                    self.raw_model,
+                    muon_lr=muon_lr,
+                    adam_lr=config.learning_rate,
+                    weight_decay=config.weight_decay,
+                    muon_momentum=muon_momentum,
+                )
+            else:
+                self._log_struct(
+                    "Using AdamW optimizer", lr=config.learning_rate, weight_decay=config.weight_decay
+                )
+                self.optimizer = torch.optim.AdamW(
+                    self.raw_model.parameters(),
+                    lr=config.learning_rate,
+                    weight_decay=config.weight_decay,
+                    betas=(0.9, 0.95),  # Standard for transformers
+                )
 
-        # Get the underlying model (unwrap DDP if needed)
-        self.raw_model = self.model.module if use_ddp else self.model
-
-        # Optimizer (use raw model for parameter groups)
-        if optimizer_type == "muon":
-            self._log_struct(
-                "Using Muon optimizer",
-                muon_lr=muon_lr,
-                adam_lr=config.learning_rate,
-                momentum=muon_momentum,
-            )
-            self.optimizer = create_muon_optimizer(
-                self.raw_model,
-                muon_lr=muon_lr,
-                adam_lr=config.learning_rate,
-                weight_decay=config.weight_decay,
-                muon_momentum=muon_momentum,
-            )
-        else:
-            self._log_struct(
-                "Using AdamW optimizer", lr=config.learning_rate, weight_decay=config.weight_decay
-            )
-            self.optimizer = torch.optim.AdamW(
-                self.raw_model.parameters(),
-                lr=config.learning_rate,
-                weight_decay=config.weight_decay,
-                betas=(0.9, 0.95),  # Standard for transformers
-            )
-
-        # Learning rate scheduler (warmup + cosine decay)
-        self.scheduler = self._create_scheduler()
+            # Learning rate scheduler (warmup + cosine decay)
+            self.scheduler = self._create_scheduler()
 
         # Curriculum learning: Start with fewer supervision steps, gradually increase
         self.current_max_steps = 2  # Start with 2 steps
@@ -328,6 +815,41 @@ class TRMTrainer:
         self.current_epoch = 0
         self.global_step = 0
         self.best_val_acc = 0.0
+
+        # Initialize EMA for stable recursive depth
+        self.ema = None
+        if use_ema:
+            self.ema = EMAModel(self.model, decay=ema_decay, device=device)
+            self._log_struct(
+                "EMA initialized",
+                decay=ema_decay,
+                note="Stabilizes recursive reasoning depth",
+            )
+
+    def _get_default_ds_config(self) -> Dict[str, Any]:
+        """Get default DeepSpeed configuration"""
+        return {
+            "train_micro_batch_size_per_gpu": "auto",
+            "gradient_accumulation_steps": 1,
+            "gradient_clipping": 1.0,
+            "fp16": {
+                "enabled": True,
+                "loss_scale": 0,
+                "loss_scale_window": 1000,
+                "initial_scale_power": 16,
+                "hysteresis": 2,
+                "min_loss_scale": 1
+            },
+            "zero_optimization": {
+                "stage": 2,
+                "overlap_comm": True,
+                "contiguous_gradients": True,
+                "reduce_bucket_size": 5e8,
+                "allgather_bucket_size": 5e8
+            },
+            "zero_allow_untested_optimizer": True,
+            "wall_clock_breakdown": False
+        }
 
     def _log(self, msg: str):
         """Print only from main process (uses global logger)"""
@@ -369,21 +891,40 @@ class TRMTrainer:
         batch = {k: v.to(self.device) for k, v in batch.items()}
 
         # Forward pass with deep supervision
-        outputs_per_step = self.model(
-            batch["input_ids"],
-            max_supervision_steps=self.current_max_steps,
-            training=True,
-            target_generation_ids=batch.get("target_generation_ids"),
-        )
+        # Use autocast for DeepSpeed FP16 to handle dtype consistency
+        if self.use_deepspeed:
+            with torch.cuda.amp.autocast(enabled=True):
+                outputs_per_step = self.model(
+                    batch["input_ids"],
+                    max_supervision_steps=self.current_max_steps,
+                    training=True,
+                    target_generation_ids=batch.get("target_generation_ids"),
+                )
 
-        # Compute loss (with special token weighting and action-generation consistency)
-        loss, loss_dict = compute_trm_loss(
-            outputs_per_step,
-            batch,
-            self.config,
-            special_token_ids=self.special_token_ids if self.special_token_ids else None,
-            tool_call_token_id=self.tool_call_token_id,
-        )
+                # Compute loss (with special token weighting and action-generation consistency)
+                loss, loss_dict = compute_trm_loss(
+                    outputs_per_step,
+                    batch,
+                    self.config,
+                    special_token_ids=self.special_token_ids if self.special_token_ids else None,
+                    tool_call_token_id=self.tool_call_token_id,
+                )
+        else:
+            outputs_per_step = self.model(
+                batch["input_ids"],
+                max_supervision_steps=self.current_max_steps,
+                training=True,
+                target_generation_ids=batch.get("target_generation_ids"),
+            )
+
+            # Compute loss (with special token weighting and action-generation consistency)
+            loss, loss_dict = compute_trm_loss(
+                outputs_per_step,
+                batch,
+                self.config,
+                special_token_ids=self.special_token_ids if self.special_token_ids else None,
+                tool_call_token_id=self.tool_call_token_id,
+            )
 
         # Compute accuracies
         acc_dict = compute_action_accuracy(outputs_per_step, batch)
@@ -391,8 +932,9 @@ class TRMTrainer:
         # Compute strict tool call format accuracy: <tool_call>{...}</tool_call>
         # Return counts for proper aggregation (avoids dilution from batches without tool_calls)
         if self.tokenizer is not None:
-            valid_count, total_count, sample_correct = compute_valid_tool_call_format_accuracy(
-                outputs_per_step, batch, self.tokenizer, return_counts=True, return_sample=True
+            (valid_count, total_count, sample_correct, sample_target,
+             sample_decoded_tokens, target_decoded_tokens) = compute_valid_tool_call_format_accuracy(
+                outputs_per_step, batch, self.tokenizer, return_counts=True, return_sample=True, return_tokens=True
             )
             acc_dict["valid_tool_format_correct"] = valid_count
             acc_dict["valid_tool_format_total"] = total_count
@@ -402,26 +944,48 @@ class TRMTrainer:
                     "Valid tool call prediction",
                     step=self.global_step,
                     prediction=sample_correct,
+                    target=sample_target,
                 )
+                # Log decoded tokens for debugging
+                if sample_decoded_tokens is not None:
+                    self._log_struct(
+                        "Decoded tokens",
+                        step=self.global_step,
+                        prediction_tokens=sample_decoded_tokens,
+                        target_tokens=target_decoded_tokens,
+                    )
 
-        # Backward pass
-        loss.backward()
+        # Backward pass and optimizer step
+        if self.use_deepspeed:
+            # DeepSpeed handles backward, gradient clipping, and optimizer step
+            self.model.backward(loss)
+            self.model.step()
+            # Get learning rate from DeepSpeed
+            lr = self.model.get_lr()[0] if hasattr(self.model, 'get_lr') else self.config.learning_rate
+        else:
+            # Standard PyTorch backward
+            loss.backward()
 
-        # Gradient clipping (prevent exploding gradients)
-        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clip_norm)
+            # Gradient clipping (prevent exploding gradients)
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.config.gradient_clip_norm)
 
-        # Optimizer step
-        self.optimizer.step()
-        self.optimizer.zero_grad()
+            # Optimizer step
+            self.optimizer.step()
+            self.optimizer.zero_grad()
 
-        # Scheduler step
-        self.scheduler.step()
+            # Scheduler step
+            self.scheduler.step()
+            lr = self.scheduler.get_last_lr()[0]
 
         self.global_step += 1
 
+        # Update EMA after each step (stabilizes recursive reasoning)
+        if self.ema is not None:
+            self.ema.update()
+
         # Combine metrics
         metrics = {**loss_dict, **acc_dict}
-        metrics["learning_rate"] = self.scheduler.get_last_lr()[0]
+        metrics["learning_rate"] = lr
 
         return loss.item(), metrics
 
@@ -439,7 +1003,7 @@ class TRMTrainer:
         total_metrics = {}
 
         # Set epoch for distributed sampler
-        if self.use_ddp and hasattr(self.train_loader.sampler, "set_epoch"):
+        if (self.use_ddp or self.use_deepspeed) and hasattr(self.train_loader.sampler, "set_epoch"):
             self.train_loader.sampler.set_epoch(epoch)
 
         # Only show progress bar on main process
@@ -503,11 +1067,17 @@ class TRMTrainer:
     def validate(self) -> Dict[str, float]:
         """Validate on validation set
 
+        Uses EMA weights if enabled for more stable evaluation.
+
         Returns:
             val_metrics: Dict with validation metrics
         """
         if self.val_loader is None:
             return {}
+
+        # Apply EMA weights for validation (if enabled)
+        if self.ema is not None:
+            self.ema.apply_shadow()
 
         self.model.eval()
         total_loss = 0.0
@@ -515,7 +1085,7 @@ class TRMTrainer:
 
         # Only show progress bar on main process
         if self.is_main:
-            loader = tqdm(self.val_loader, desc="Validating")
+            loader = tqdm(self.val_loader, desc="Validating (EMA)" if self.ema else "Validating")
         else:
             loader = self.val_loader
 
@@ -565,6 +1135,10 @@ class TRMTrainer:
         tool_fmt_correct = total_metrics.get("valid_tool_format_correct", 0)
         tool_fmt_total = total_metrics.get("valid_tool_format_total", 0)
         val_metrics["val_valid_tool_format"] = tool_fmt_correct / tool_fmt_total if tool_fmt_total > 0 else 0.0
+
+        # Restore original weights after validation (if using EMA)
+        if self.ema is not None:
+            self.ema.restore()
 
         return val_metrics
 
@@ -658,54 +1232,143 @@ class TRMTrainer:
         self.model.train()
 
     def save_checkpoint(self, epoch: int, metrics: Dict[str, float], filepath: str):
-        """Save model checkpoint (only on main process)
+        """Save model checkpoint (only on main process, or all ranks for DeepSpeed)
 
         Args:
             epoch: Current epoch
             metrics: Current metrics
             filepath: Path to save checkpoint
         """
-        # Only save on main process
-        if not self.is_main:
-            return
+        if self.use_deepspeed:
+            # DeepSpeed saves checkpoints to a directory
+            save_dir = filepath.replace(".pt", "_ds")
+            client_state = {
+                "epoch": epoch,
+                "global_step": self.global_step,
+                "config": self.config,
+                "metrics": metrics,
+                "current_max_steps": self.current_max_steps,
+            }
+            # Include EMA state if enabled
+            if self.ema is not None:
+                client_state["ema_state_dict"] = self.ema.state_dict()
+            self.model.save_checkpoint(save_dir, client_state=client_state)
+            if self.is_main:
+                log("DeepSpeed checkpoint saved", path=save_dir, epoch=epoch + 1, ema=self.ema is not None)
 
-        os.makedirs(os.path.dirname(filepath) if os.path.dirname(filepath) else ".", exist_ok=True)
+            # Also save a regular checkpoint for inference (main process only)
+            # Use EMA weights for inference checkpoint if available
+            if self.is_main:
+                os.makedirs(os.path.dirname(filepath) if os.path.dirname(filepath) else ".", exist_ok=True)
+                # For inference, use EMA weights if available (better generalization)
+                if self.ema is not None:
+                    self.ema.apply_shadow()
+                inference_checkpoint = {
+                    "epoch": epoch,
+                    "global_step": self.global_step,
+                    "model_state_dict": self.raw_model.state_dict(),
+                    "config": self.config,
+                    "metrics": metrics,
+                    "current_max_steps": self.current_max_steps,
+                    "used_ema": self.ema is not None,
+                }
+                torch.save(inference_checkpoint, filepath)
+                if self.ema is not None:
+                    self.ema.restore()
+                log("Inference checkpoint saved", path=filepath, epoch=epoch + 1, ema=self.ema is not None)
+        else:
+            # Only save on main process
+            if not self.is_main:
+                return
 
-        # Save raw model state (unwrap DDP)
-        checkpoint = {
-            "epoch": epoch,
-            "global_step": self.global_step,
-            "model_state_dict": self.raw_model.state_dict(),
-            "optimizer_state_dict": self.optimizer.state_dict(),
-            "scheduler_state_dict": self.scheduler.state_dict(),
-            "config": self.config,
-            "metrics": metrics,
-            "current_max_steps": self.current_max_steps,
-        }
+            os.makedirs(os.path.dirname(filepath) if os.path.dirname(filepath) else ".", exist_ok=True)
 
-        torch.save(checkpoint, filepath)
-        log("Checkpoint saved", path=filepath, epoch=epoch + 1)
+            # Save raw model state (unwrap DDP)
+            checkpoint = {
+                "epoch": epoch,
+                "global_step": self.global_step,
+                "model_state_dict": self.raw_model.state_dict(),
+                "optimizer_state_dict": self.optimizer.state_dict(),
+                "scheduler_state_dict": self.scheduler.state_dict() if self.scheduler else None,
+                "config": self.config,
+                "metrics": metrics,
+                "current_max_steps": self.current_max_steps,
+            }
+            # Include EMA state if enabled
+            if self.ema is not None:
+                checkpoint["ema_state_dict"] = self.ema.state_dict()
+
+            torch.save(checkpoint, filepath)
+            log("Checkpoint saved", path=filepath, epoch=epoch + 1, ema=self.ema is not None)
 
     def load_checkpoint(self, filepath: str):
         """Load model checkpoint
 
         Args:
-            filepath: Path to checkpoint
+            filepath: Path to checkpoint (or directory for DeepSpeed)
         """
-        checkpoint = torch.load(filepath, map_location=self.device, weights_only=False)
+        if self.use_deepspeed:
+            # Try DeepSpeed checkpoint first
+            ds_path = filepath.replace(".pt", "_ds")
+            if os.path.isdir(ds_path):
+                _, client_state = self.model.load_checkpoint(ds_path)
+                self.current_epoch = client_state.get("epoch", 0)
+                self.global_step = client_state.get("global_step", 0)
+                self.current_max_steps = client_state.get("current_max_steps", 2)
+                # Load EMA state if available
+                if self.ema is not None and "ema_state_dict" in client_state:
+                    self.ema.load_state_dict(client_state["ema_state_dict"])
+                    self._log_struct(
+                        "DeepSpeed checkpoint loaded with EMA",
+                        path=ds_path,
+                        epoch=self.current_epoch,
+                        step=self.global_step,
+                        ema_decay=self.ema.decay,
+                    )
+                else:
+                    self._log_struct(
+                        "DeepSpeed checkpoint loaded",
+                        path=ds_path,
+                        epoch=self.current_epoch,
+                        step=self.global_step,
+                    )
+            else:
+                # Fall back to regular checkpoint (for inference weights only)
+                checkpoint = torch.load(filepath, map_location=self.device, weights_only=False)
+                self.raw_model.load_state_dict(checkpoint["model_state_dict"])
+                self.current_epoch = checkpoint.get("epoch", 0)
+                self.global_step = checkpoint.get("global_step", 0)
+                self.current_max_steps = checkpoint.get("current_max_steps", 2)
+                self._log_struct(
+                    "Regular checkpoint loaded into DeepSpeed", path=filepath, epoch=self.current_epoch
+                )
+        else:
+            checkpoint = torch.load(filepath, map_location=self.device, weights_only=False)
 
-        # Load into raw model (handles both DDP and non-DDP)
-        self.raw_model.load_state_dict(checkpoint["model_state_dict"])
-        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+            # Load into raw model (handles both DDP and non-DDP)
+            self.raw_model.load_state_dict(checkpoint["model_state_dict"])
+            if "optimizer_state_dict" in checkpoint:
+                self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            if "scheduler_state_dict" in checkpoint and checkpoint["scheduler_state_dict"] and self.scheduler:
+                self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
 
-        self.current_epoch = checkpoint["epoch"]
-        self.global_step = checkpoint["global_step"]
-        self.current_max_steps = checkpoint.get("current_max_steps", 2)
+            self.current_epoch = checkpoint.get("epoch", 0)
+            self.global_step = checkpoint.get("global_step", 0)
+            self.current_max_steps = checkpoint.get("current_max_steps", 2)
 
-        self._log_struct(
-            "Checkpoint loaded", path=filepath, epoch=self.current_epoch, step=self.global_step
-        )
+            # Load EMA state if available and EMA is enabled
+            ema_loaded = False
+            if self.ema is not None and "ema_state_dict" in checkpoint:
+                self.ema.load_state_dict(checkpoint["ema_state_dict"])
+                ema_loaded = True
+
+            self._log_struct(
+                "Checkpoint loaded",
+                path=filepath,
+                epoch=self.current_epoch,
+                step=self.global_step,
+                ema=ema_loaded,
+            )
 
     def train(self, save_dir: str = "checkpoints"):
         """Full training loop
@@ -722,7 +1385,7 @@ class TRMTrainer:
         }
         if self.val_loader:
             training_info["val_examples"] = len(self.val_loader.dataset)
-        if self.use_ddp:
+        if self.use_ddp or self.use_deepspeed:
             training_info["world_size"] = f"{self.world_size} GPUs"
             training_info["effective_batch_size"] = self.config.batch_size * self.world_size
         self._log_struct("Starting TRM-LLM Training", **training_info)
@@ -734,17 +1397,23 @@ class TRMTrainer:
             self.update_curriculum(epoch)
 
             # Train epoch
+            # Get learning rate (handle DeepSpeed where scheduler may be None)
+            if self.use_deepspeed:
+                current_lr = self.model.get_lr()[0] if hasattr(self.model, 'get_lr') else self.config.learning_rate
+            else:
+                current_lr = self.scheduler.get_last_lr()[0]
+
             self._log_struct(
                 "Epoch started",
                 epoch=f"{epoch+1}/{self.config.max_epochs}",
                 max_supervision_steps=self.current_max_steps,
-                learning_rate=f"{self.scheduler.get_last_lr()[0]:.6f}",
+                learning_rate=f"{current_lr:.6f}",
             )
 
             train_metrics = self.train_epoch(epoch)
 
-            # Synchronize metrics across processes (for DDP)
-            if self.use_ddp:
+            # Synchronize metrics across processes (for DDP/DeepSpeed)
+            if self.use_ddp or self.use_deepspeed:
                 dist.barrier()
 
             # Print training metrics (main process only)
@@ -792,7 +1461,7 @@ class TRMTrainer:
                 )
 
             # Synchronize before next epoch
-            if self.use_ddp:
+            if self.use_ddp or self.use_deepspeed:
                 dist.barrier()
 
         self._log_struct("Training completed", best_val_accuracy=f"{self.best_val_acc:.3f}")

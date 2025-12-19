@@ -12,6 +12,15 @@ Usage (multi-GPU with DDP via torchrun):
 
 Usage (multi-GPU with uv and torchrun):
     uv run torchrun --nproc_per_node=4 scripts/train.py --data_path data/train.jsonl --ddp
+
+Usage (multi-GPU with DeepSpeed):
+    deepspeed --num_gpus=4 scripts/train.py --data_path data/train.jsonl --deepspeed
+
+Usage (DeepSpeed with ZeRO-3 for larger models):
+    deepspeed --num_gpus=4 scripts/train.py --data_path data/train.jsonl --deepspeed --zero_stage 3
+
+Usage (DeepSpeed with custom config):
+    deepspeed --num_gpus=4 scripts/train.py --data_path data/train.jsonl --deepspeed --ds_config configs/ds_config.json
 """
 
 import argparse
@@ -57,6 +66,12 @@ def parse_args():
         type=int,
         default=8000,
         help="Vocabulary size for SentencePiece training (default: 8000, ignored if --sp_model provided)",
+    )
+    parser.add_argument(
+        "--special_tokens",
+        type=str,
+        default=None,
+        help="Path to special tokens file (one token per line). If not provided, uses defaults.",
     )
 
     # Model
@@ -158,6 +173,17 @@ def parse_args():
         default=0.1,
         help="Label smoothing for generation loss (default: 0.1, 0.0 = no smoothing)",
     )
+    parser.add_argument(
+        "--use_ema",
+        action="store_true",
+        help="Enable EMA (Exponential Moving Average) for stable recursive depth",
+    )
+    parser.add_argument(
+        "--ema_decay",
+        type=float,
+        default=0.9999,
+        help="EMA decay rate (default: 0.9999, higher = more smoothing)",
+    )
 
     # Architecture options
     parser.add_argument(
@@ -223,6 +249,26 @@ def parse_args():
         help="Local rank for DDP (automatically set by torchrun, do not set manually)",
     )
 
+    # DeepSpeed
+    parser.add_argument(
+        "--deepspeed",
+        action="store_true",
+        help="Enable DeepSpeed for memory-efficient training with ZeRO optimization",
+    )
+    parser.add_argument(
+        "--ds_config",
+        type=str,
+        default=None,
+        help="Path to DeepSpeed config JSON file (default: use built-in config)",
+    )
+    parser.add_argument(
+        "--zero_stage",
+        type=int,
+        default=2,
+        choices=[0, 1, 2, 3],
+        help="DeepSpeed ZeRO stage (default: 2). 0=disabled, 1=optimizer, 2=optimizer+gradients, 3=full",
+    )
+
     return parser.parse_args()
 
 
@@ -231,9 +277,26 @@ def main():
 
     # Initialize distributed training if requested
     rank, world_size, use_ddp = 0, 1, False
+    use_deepspeed = args.deepspeed
     local_rank = 0
 
-    if args.ddp:
+    # DeepSpeed takes priority over DDP
+    if use_deepspeed:
+        # Get local_rank from environment (set by deepspeed launcher)
+        local_rank = int(os.environ.get("LOCAL_RANK", args.local_rank))
+        if local_rank < 0:
+            local_rank = 0
+        rank = int(os.environ.get("RANK", 0))
+        world_size = int(os.environ.get("WORLD_SIZE", 1))
+
+        # Update device to use local GPU
+        args.device = f"cuda:{local_rank}"
+        torch.cuda.set_device(local_rank)
+
+        # Reset logger cache
+        reset_main_process_cache()
+
+    elif args.ddp:
         # Get local_rank from environment (set by torchrun) or argument
         local_rank = int(os.environ.get("LOCAL_RANK", args.local_rank))
         if local_rank < 0:
@@ -249,6 +312,36 @@ def main():
 
     log("TRM-LLM Training started")
 
+    # Prepare DeepSpeed config if using DeepSpeed
+    ds_config = None
+    if use_deepspeed:
+        if args.ds_config:
+            ds_config = args.ds_config  # Path to config file
+        else:
+            # Build config from arguments
+            ds_config = {
+                "train_micro_batch_size_per_gpu": args.batch_size,
+                "gradient_accumulation_steps": 1,
+                "gradient_clipping": 1.0,
+                "fp16": {
+                    "enabled": True,
+                    "loss_scale": 0,
+                    "loss_scale_window": 1000,
+                    "initial_scale_power": 16,
+                    "hysteresis": 2,
+                    "min_loss_scale": 1
+                },
+                "zero_optimization": {
+                    "stage": args.zero_stage,
+                    "overlap_comm": True,
+                    "contiguous_gradients": True,
+                    "reduce_bucket_size": 5e8,
+                    "allgather_bucket_size": 5e8
+                },
+                "zero_allow_untested_optimizer": True,
+                "wall_clock_breakdown": False
+            }
+
     # Log training configuration
     train_config = {
         "data_path": args.data_path,
@@ -259,8 +352,18 @@ def main():
     }
     if args.sp_model:
         train_config["sp_model"] = args.sp_model
+    if args.special_tokens:
+        train_config["special_tokens"] = args.special_tokens
     if use_ddp:
         train_config.update({"rank": rank, "world_size": world_size, "local_rank": local_rank})
+    if use_deepspeed:
+        train_config.update({
+            "deepspeed": True,
+            "zero_stage": args.zero_stage,
+            "rank": rank,
+            "world_size": world_size,
+            "local_rank": local_rank,
+        })
     if args.optimizer == "muon":
         train_config.update(
             {
@@ -271,6 +374,8 @@ def main():
         )
     else:
         train_config["learning_rate"] = args.learning_rate
+    if args.use_ema:
+        train_config.update({"use_ema": True, "ema_decay": args.ema_decay})
 
     log("Training configuration", **train_config)
 
@@ -308,16 +413,23 @@ def main():
     )
 
     # Initialize SentencePiece tokenizer
-    # Only main process should train tokenizer in DDP mode
-    tokenizer = SentencePieceTokenizer(vocab_size=args.vocab_size)
+    # Only main process should train tokenizer in distributed mode (DDP or DeepSpeed)
+    tokenizer = SentencePieceTokenizer(
+        vocab_size=args.vocab_size,
+        special_tokens_file=args.special_tokens,
+    )
+    is_distributed = use_ddp or use_deepspeed
+    is_main = (rank == 0)
 
     if args.sp_model and os.path.exists(args.sp_model):
         # Load pre-trained SentencePiece model
         tokenizer.load(args.sp_model)
         log("SentencePiece model loaded", path=args.sp_model, vocab_size=tokenizer.vocab_size)
     else:
-        # Train SentencePiece model from dataset
-        if is_main_process():
+        # Train SentencePiece model from dataset (only on rank 0)
+        sp_model_path = os.path.join(args.save_dir, "sp_tokenizer.model")
+
+        if is_main:
             os.makedirs(args.save_dir, exist_ok=True)
 
             # Collect all data paths for training
@@ -334,13 +446,16 @@ def main():
             )
             log("SentencePiece model trained", path=sp_model_path, vocab_size=tokenizer.vocab_size)
 
-        # Synchronize in DDP mode - other processes wait and then load
-        if use_ddp:
+        # Synchronize in distributed mode - other processes wait and then load
+        if is_distributed:
             import torch.distributed as dist
+            # Initialize process group for DeepSpeed if not already done
+            if use_deepspeed and not dist.is_initialized():
+                dist.init_process_group(backend="nccl")
             dist.barrier()
-            if not is_main_process():
-                sp_model_path = os.path.join(args.save_dir, "sp_tokenizer.model")
+            if not is_main:
                 tokenizer.load(sp_model_path)
+                log("SentencePiece model loaded (synced)", path=sp_model_path, vocab_size=tokenizer.vocab_size)
 
     config.vocab_size = tokenizer.vocab_size
 
@@ -484,11 +599,11 @@ def main():
     # Create dataloaders
     collator = DataCollator(tokenizer.pad_token_id)
 
-    # Use DistributedSampler for DDP
+    # Use DistributedSampler for DDP or DeepSpeed
     train_sampler = None
     val_sampler = None
 
-    if use_ddp:
+    if use_ddp or use_deepspeed:
         train_sampler = DistributedSampler(
             train_dataset,
             num_replicas=world_size,
@@ -509,7 +624,7 @@ def main():
 
     val_loader = None
     if val_dataset is not None:
-        if use_ddp:
+        if use_ddp or use_deepspeed:
             val_sampler = DistributedSampler(
                 val_dataset,
                 num_replicas=world_size,
@@ -555,6 +670,10 @@ def main():
         muon_momentum=args.muon_momentum,
         use_ddp=use_ddp,
         local_rank=local_rank,
+        use_deepspeed=use_deepspeed,
+        ds_config=ds_config,
+        use_ema=args.use_ema,
+        ema_decay=args.ema_decay,
     )
 
     # Resume from checkpoint if provided
@@ -583,11 +702,14 @@ def main():
         training_args = {
             "sp_model": os.path.join(args.save_dir, "sp_tokenizer.model"),
             "vocab_size": tokenizer.vocab_size,
+            "special_tokens": args.special_tokens,
             "optimizer": args.optimizer,
             "muon_lr": args.muon_lr if args.optimizer == "muon" else None,
             "muon_momentum": args.muon_momentum if args.optimizer == "muon" else None,
             "ddp": use_ddp,
             "world_size": world_size,
+            "use_ema": args.use_ema,
+            "ema_decay": args.ema_decay if args.use_ema else None,
         }
         training_args_path = os.path.join(args.save_dir, "training_args.json")
         with open(training_args_path, "w") as f:

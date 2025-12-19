@@ -24,7 +24,7 @@ class TRMInference:
         model: torch.nn.Module,
         tokenizer: ToolCallTokenizer,
         config: TRMLLMConfig,
-        device: str = 'cuda'
+        device: str = "cuda",
     ):
         """
         Args:
@@ -58,7 +58,8 @@ class TRMInference:
         generate_params: bool = True,
         generate_response: bool = True,
         max_param_len: int = 64,
-        max_response_len: int = 128
+        max_response_len: int = 128,
+        system_prompt: Optional[str] = None,
     ) -> Dict:
         """Generate prediction for a user query
 
@@ -70,6 +71,7 @@ class TRMInference:
             generate_response: Whether to generate response text for direct_answer
             max_param_len: Maximum parameter sequence length
             max_response_len: Maximum response sequence length
+            system_prompt: Optional system prompt to prepend to conversation
 
         Returns:
             result: Dict with:
@@ -84,15 +86,16 @@ class TRMInference:
         max_steps = max_steps or self.config.max_supervision_steps
 
         # Encode input
-        messages = [{'role': 'user', 'content': user_query}]
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": user_query})
         input_ids = self.tokenizer.encode_conversation(tools_json, messages)
         input_ids = torch.tensor([input_ids], device=self.device)
 
         # Forward with ACT (early stopping)
         outputs_per_step = self.model(
-            input_ids,
-            max_supervision_steps=max_steps,
-            training=False  # Enables ACT early stopping
+            input_ids, max_supervision_steps=max_steps, training=False  # Enables ACT early stopping
         )
 
         num_steps_used = len(outputs_per_step)
@@ -101,58 +104,175 @@ class TRMInference:
         final_output = outputs_per_step[-1]
 
         # Decode action
-        action_probs = F.softmax(final_output['action_logits'], dim=-1)[0]
+        action_probs = F.softmax(final_output["action_logits"], dim=-1)[0]
         action_id = action_probs.argmax().item()
 
         if action_id == 0:
             # Direct answer - generate response text
             response_text = None
-            if generate_response and hasattr(self.model, 'generate_response'):
-                y_state = final_output['y_state']  # (1, action_dim)
+            if generate_response and hasattr(self.model, "generate_response"):
+                y_state = final_output["y_state"]  # (1, action_dim)
                 response_ids = self.model.generate_response(y_state, max_length=max_response_len)
-                response_text = self.tokenizer.decode(response_ids[0].tolist(), skip_special_tokens=True)
+                response_text = self.tokenizer.decode(
+                    response_ids[0].tolist(), skip_special_tokens=True
+                )
 
             return {
-                'action': 'direct_answer',
-                'tool_name': None,
-                'tool_id': None,
-                'num_parallel_calls': 0,
-                'tool_call': None,
-                'response': response_text,
-                'confidence': action_probs[0].item(),
-                'num_steps': num_steps_used
+                "action": "direct_answer",
+                "tool_name": None,
+                "tool_id": None,
+                "num_parallel_calls": 0,
+                "tool_call": None,
+                "response": response_text,
+                "confidence": action_probs[0].item(),
+                "num_steps": num_steps_used,
             }
         else:
             # Tool call
-            tool_probs = F.softmax(final_output['tool_logits'], dim=-1)[0]
+            tool_probs = F.softmax(final_output["tool_logits"], dim=-1)[0]
             tool_id = tool_probs.argmax().item()
             tool_name = self.tool_id_to_name.get(tool_id, f"unknown_tool_{tool_id}")
 
             # Number of parallel calls
             num_parallel_calls = 1
-            if 'num_calls_logits' in final_output:
-                num_calls_probs = F.softmax(final_output['num_calls_logits'], dim=-1)[0]
+            if "num_calls_logits" in final_output:
+                num_calls_probs = F.softmax(final_output["num_calls_logits"], dim=-1)[0]
                 num_parallel_calls = num_calls_probs.argmax().item() + 1  # 0-indexed to 1-indexed
 
             confidence = action_probs[1].item() * tool_probs[tool_id].item()
 
             # Generate tool parameters
             tool_call = None
-            if generate_params and hasattr(self.model, 'generate_params'):
-                y_state = final_output['y_state']  # (1, action_dim)
+            if generate_params and hasattr(self.model, "generate_params"):
+                y_state = final_output["y_state"]  # (1, action_dim)
                 param_ids = self.model.generate_params(y_state, max_length=max_param_len)
                 param_text = self.tokenizer.decode(param_ids[0].tolist(), skip_special_tokens=True)
                 tool_call = self._parse_tool_call(param_text, tool_name)
 
             return {
-                'action': 'tool_call',
-                'tool_name': tool_name,
-                'tool_id': tool_id,
-                'num_parallel_calls': num_parallel_calls,
-                'tool_call': tool_call,
-                'response': None,
-                'confidence': confidence,
-                'num_steps': num_steps_used
+                "action": "tool_call",
+                "tool_name": tool_name,
+                "tool_id": tool_id,
+                "num_parallel_calls": num_parallel_calls,
+                "tool_call": tool_call,
+                "response": None,
+                "confidence": confidence,
+                "num_steps": num_steps_used,
+            }
+
+    @torch.no_grad()
+    def generate_with_history(
+        self,
+        messages: List[Dict[str, str]],
+        tools_json: str,
+        max_steps: Optional[int] = None,
+        generate_params: bool = True,
+        generate_response: bool = True,
+        max_param_len: int = 64,
+        max_response_len: int = 128,
+    ) -> Dict:
+        """Generate prediction with full conversation history
+
+        Args:
+            messages: List of message dicts with 'role' and 'content'
+                      Roles: 'system', 'user', 'assistant', 'tool_call', 'tool_response'
+            tools_json: JSON string with tool definitions
+            max_steps: Maximum supervision steps (uses config value if None)
+            generate_params: Whether to generate tool parameters
+            generate_response: Whether to generate response text for direct_answer
+            max_param_len: Maximum parameter sequence length
+            max_response_len: Maximum response sequence length
+
+        Returns:
+            result: Dict with action, tool_call info, or response
+        """
+        max_steps = max_steps or self.config.max_supervision_steps
+
+        # Encode full conversation
+        input_ids = self.tokenizer.encode_conversation(tools_json, messages)
+        input_ids = torch.tensor([input_ids], device=self.device)
+
+        # Forward with ACT (early stopping)
+        outputs_per_step = self.model(input_ids, max_supervision_steps=max_steps, training=False)
+
+        num_steps_used = len(outputs_per_step)
+        final_output = outputs_per_step[-1]
+
+        # Decode action
+        action_probs = F.softmax(final_output["action_logits"], dim=-1)[0]
+        action_id = action_probs.argmax().item()
+
+        if action_id == 0:
+            # Direct answer
+            response_text = None
+            token_ids = None
+            if generate_response:
+                y_state = final_output["y_state"]
+                encoder_output = final_output.get("encoder_output")
+                action_logits = final_output.get("action_logits")
+                response_ids = self.model.generate(
+                    y_state,
+                    max_length=max_response_len,
+                    temperature=0.7,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                    encoder_output=encoder_output,
+                    action_logits=action_logits,
+                )
+                token_ids = response_ids[0].tolist()
+                response_text = self.tokenizer.decode(token_ids, skip_special_tokens=False)
+
+            return {
+                "action": "direct_answer",
+                "tool_name": None,
+                "tool_id": None,
+                "num_parallel_calls": 0,
+                "tool_call": None,
+                "response": response_text,
+                "token_ids": token_ids,
+                "confidence": action_probs[0].item(),
+                "num_steps": num_steps_used,
+            }
+        else:
+            # Tool call
+            num_calls_probs = F.softmax(final_output["num_calls_logits"], dim=-1)[0]
+            num_parallel_calls = num_calls_probs.argmax().item() + 1
+
+            # Generate tool call
+            tool_call = None
+            tool_name = "unknown"
+            tool_id = -1
+            token_ids = None
+
+            if generate_params:
+                y_state = final_output["y_state"]
+                encoder_output = final_output.get("encoder_output")
+                action_logits = final_output.get("action_logits")
+                param_ids = self.model.generate(
+                    y_state,
+                    max_length=max_param_len,
+                    temperature=0.7,
+                    eos_token_id=self.tokenizer.eos_token_id,
+                    encoder_output=encoder_output,
+                    action_logits=action_logits,
+                )
+                token_ids = param_ids[0].tolist()
+                param_text = self.tokenizer.decode(token_ids, skip_special_tokens=False)
+                tool_call = self._parse_tool_call(param_text, tool_name)
+                if tool_call and "name" in tool_call:
+                    tool_name = tool_call["name"]
+
+            confidence = action_probs[1].item()
+
+            return {
+                "action": "tool_call",
+                "tool_name": tool_name,
+                "tool_id": tool_id,
+                "num_parallel_calls": num_parallel_calls,
+                "tool_call": tool_call,
+                "response": None,
+                "token_ids": token_ids,
+                "confidence": confidence,
+                "num_steps": num_steps_used,
             }
 
     def _parse_tool_call(self, param_text: str, fallback_name: str) -> Optional[Dict]:
@@ -169,33 +289,30 @@ class TRMInference:
         param_text = param_text.strip()
 
         # Try to find JSON object in the text
-        start_idx = param_text.find('{')
-        end_idx = param_text.rfind('}')
+        start_idx = param_text.find("{")
+        end_idx = param_text.rfind("}")
 
         if start_idx != -1 and end_idx != -1 and end_idx > start_idx:
-            json_str = param_text[start_idx:end_idx + 1]
+            json_str = param_text[start_idx : end_idx + 1]
             try:
                 parsed = json.loads(json_str)
                 # Check if it's a full tool call or just arguments
-                if 'name' in parsed and 'arguments' in parsed:
+                if "name" in parsed and "arguments" in parsed:
                     return parsed
-                elif 'arguments' in parsed:
-                    return {'name': fallback_name, 'arguments': parsed['arguments']}
+                elif "arguments" in parsed:
+                    return {"name": fallback_name, "arguments": parsed["arguments"]}
                 else:
                     # Assume the whole thing is arguments
-                    return {'name': fallback_name, 'arguments': parsed}
+                    return {"name": fallback_name, "arguments": parsed}
             except json.JSONDecodeError:
                 pass
 
         # Return None if parsing fails
-        return {'name': fallback_name, 'arguments': {}, 'raw_output': param_text}
+        return {"name": fallback_name, "arguments": {}, "raw_output": param_text}
 
     @torch.no_grad()
     def generate_batch(
-        self,
-        user_queries: List[str],
-        tools_json: str,
-        max_steps: Optional[int] = None
+        self, user_queries: List[str], tools_json: str, max_steps: Optional[int] = None
     ) -> List[Dict]:
         """Generate predictions for a batch of queries
 
@@ -212,7 +329,7 @@ class TRMInference:
         # Encode all queries
         all_input_ids = []
         for query in user_queries:
-            messages = [{'role': 'user', 'content': query}]
+            messages = [{"role": "user", "content": query}]
             input_ids = self.tokenizer.encode_conversation(tools_json, messages)
             all_input_ids.append(input_ids)
 
@@ -226,11 +343,7 @@ class TRMInference:
         input_ids = torch.tensor(padded_ids, device=self.device)
 
         # Forward pass
-        outputs_per_step = self.model(
-            input_ids,
-            max_supervision_steps=max_steps,
-            training=False
-        )
+        outputs_per_step = self.model(input_ids, max_supervision_steps=max_steps, training=False)
 
         num_steps_used = len(outputs_per_step)
         final_output = outputs_per_step[-1]
@@ -240,80 +353,85 @@ class TRMInference:
         results = []
 
         for i in range(batch_size):
-            action_probs = F.softmax(final_output['action_logits'][i], dim=-1)
+            action_probs = F.softmax(final_output["action_logits"][i], dim=-1)
             action_id = action_probs.argmax().item()
 
             if action_id == 0:
-                results.append({
-                    'action': 'direct_answer',
-                    'tool_name': None,
-                    'tool_id': None,
-                    'confidence': action_probs[0].item(),
-                    'num_steps': num_steps_used
-                })
+                results.append(
+                    {
+                        "action": "direct_answer",
+                        "tool_name": None,
+                        "tool_id": None,
+                        "confidence": action_probs[0].item(),
+                        "num_steps": num_steps_used,
+                    }
+                )
             else:
-                tool_probs = F.softmax(final_output['tool_logits'][i], dim=-1)
+                tool_probs = F.softmax(final_output["tool_logits"][i], dim=-1)
                 tool_id = tool_probs.argmax().item()
                 tool_name = self.tool_id_to_name.get(tool_id, f"unknown_tool_{tool_id}")
 
-                results.append({
-                    'action': 'tool_call',
-                    'tool_name': tool_name,
-                    'tool_id': tool_id,
-                    'confidence': action_probs[1].item() * tool_probs[tool_id].item(),
-                    'num_steps': num_steps_used
-                })
+                results.append(
+                    {
+                        "action": "tool_call",
+                        "tool_name": tool_name,
+                        "tool_id": tool_id,
+                        "confidence": action_probs[1].item() * tool_probs[tool_id].item(),
+                        "num_steps": num_steps_used,
+                    }
+                )
 
         return results
 
     def analyze_refinement(
         self,
         user_query: str,
-        tools_json: str
+        tools_json: str,
+        system_prompt: Optional[str] = None,
     ) -> Dict:
         """Analyze how the model refines its prediction across steps
 
         Args:
             user_query: User's question
             tools_json: Tool definitions
+            system_prompt: Optional system prompt
 
         Returns:
             analysis: Dict with per-step predictions and confidences
         """
-        messages = [{'role': 'user', 'content': user_query}]
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append({"role": "user", "content": user_query})
         input_ids = self.tokenizer.encode_conversation(tools_json, messages)
         input_ids = torch.tensor([input_ids], device=self.device)
 
         # Forward with all steps
         outputs_per_step = self.model(
-            input_ids,
-            max_supervision_steps=self.config.max_supervision_steps,
-            training=False
+            input_ids, max_supervision_steps=self.config.max_supervision_steps, training=False
         )
 
         # Analyze each step
         step_analysis = []
 
         for step_idx, outputs in enumerate(outputs_per_step):
-            action_probs = F.softmax(outputs['action_logits'][0], dim=-1)
-            tool_probs = F.softmax(outputs['tool_logits'][0], dim=-1)
-            halt_prob = torch.sigmoid(outputs['halt_logit'][0]).item()
+            action_probs = F.softmax(outputs["action_logits"][0], dim=-1)
+            tool_probs = F.softmax(outputs["tool_logits"][0], dim=-1)
+            halt_prob = torch.sigmoid(outputs["halt_logit"][0]).item()
 
             action_id = action_probs.argmax().item()
             tool_id = tool_probs.argmax().item()
 
-            step_analysis.append({
-                'step': step_idx + 1,
-                'action': 'tool_call' if action_id == 1 else 'direct_answer',
-                'action_confidence': action_probs[action_id].item(),
-                'tool_id': tool_id if action_id == 1 else None,
-                'tool_name': self.tool_id_to_name.get(tool_id) if action_id == 1 else None,
-                'tool_confidence': tool_probs[tool_id].item() if action_id == 1 else None,
-                'halt_prob': halt_prob,
-            })
+            step_analysis.append(
+                {
+                    "step": step_idx + 1,
+                    "action": "tool_call" if action_id == 1 else "direct_answer",
+                    "action_confidence": action_probs[action_id].item(),
+                    "tool_id": tool_id if action_id == 1 else None,
+                    "tool_name": self.tool_id_to_name.get(tool_id) if action_id == 1 else None,
+                    "tool_confidence": tool_probs[tool_id].item() if action_id == 1 else None,
+                    "halt_prob": halt_prob,
+                }
+            )
 
-        return {
-            'query': user_query,
-            'steps': step_analysis,
-            'total_steps': len(step_analysis)
-        }
+        return {"query": user_query, "steps": step_analysis, "total_steps": len(step_analysis)}

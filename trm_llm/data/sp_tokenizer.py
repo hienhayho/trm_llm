@@ -12,6 +12,74 @@ from typing import Dict, List, Optional
 import sentencepiece as spm
 
 
+def load_special_tokens_from_file(filepath: str) -> Dict[str, any]:
+    """Load special tokens from a text file
+
+    The file should have one token per line in order:
+    1. IM_START (e.g., <|im_start|>)
+    2. IM_END (e.g., <|im_end|>)
+    3. TOOLS_START (e.g., <tools>)
+    4. TOOLS_END (e.g., </tools>)
+    5. TOOL_CALL_START (e.g., <tool_call>)
+    6. TOOL_CALL_END (e.g., </tool_call>)
+    7. TOOL_RESPONSE_START (e.g., <tool_response>)
+    8. TOOL_RESPONSE_END (e.g., </tool_response>)
+    9+ Additional tokens (e.g., {, }, " for JSON structure)
+
+    Args:
+        filepath: Path to the special tokens file
+
+    Returns:
+        Dict with:
+            - Named token mappings (IM_START, etc.)
+            - "ADDITIONAL_TOKENS": list of extra tokens beyond the required 8
+    """
+    token_names = [
+        "IM_START",
+        "IM_END",
+        "TOOLS_START",
+        "TOOLS_END",
+        "TOOL_CALL_START",
+        "TOOL_CALL_END",
+        "TOOL_RESPONSE_START",
+        "TOOL_RESPONSE_END",
+    ]
+
+    tokens = {}
+
+    with open(filepath, "r", encoding="utf-8") as f:
+        lines = [line.strip() for line in f if line.strip()]
+
+    if len(lines) < len(token_names):
+        raise ValueError(
+            f"Special tokens file must have at least {len(token_names)} tokens, "
+            f"but only {len(lines)} were found in {filepath}"
+        )
+
+    # Load the required named tokens
+    for i, name in enumerate(token_names):
+        tokens[name] = lines[i]
+
+    # Load any additional tokens (lines 9+)
+    tokens["ADDITIONAL_TOKENS"] = lines[len(token_names):]
+
+    return tokens
+
+
+# Default special tokens (used when no file is provided)
+DEFAULT_SPECIAL_TOKENS = {
+    "IM_START": "<|im_start|>",
+    "IM_END": "<|im_end|>",
+    "TOOLS_START": "<tools>",
+    "TOOLS_END": "</tools>",
+    "TOOL_CALL_START": "<tool_call>",
+    "TOOL_CALL_END": "</tool_call>",
+    "TOOL_RESPONSE_START": "<tool_response>",
+    "TOOL_RESPONSE_END": "</tool_response>",
+    "ADDITIONAL_TOKENS": [],  # No additional tokens by default
+}
+
+
 class SentencePieceTokenizer:
     """SentencePiece-based tokenizer for tool-calling conversations
 
@@ -19,7 +87,7 @@ class SentencePieceTokenizer:
     1. Train a new SentencePiece model from JSONL data
     2. Load a pre-trained SentencePiece model
 
-    Uses Hermes-style special tokens:
+    Uses Hermes-style special tokens (can be loaded from file):
     - <|im_start|>: Start of message
     - <|im_end|>: End of message
     - <tools>: Start of tools definition
@@ -35,17 +103,12 @@ class SentencePieceTokenizer:
     - user: Role token for user messages
     - assistant: Role token for assistant messages
     - system: Role token for system messages
+
+    Special tokens can be loaded from a text file (one per line) by passing
+    special_tokens_file to __init__.
     """
 
-    # Special tokens (must be defined before training)
-    IM_START = "<|im_start|>"
-    IM_END = "<|im_end|>"
-    TOOLS_START = "<tools>"
-    TOOLS_END = "</tools>"
-    TOOL_CALL_START = "<tool_call>"
-    TOOL_CALL_END = "</tool_call>"
-    TOOL_RESPONSE_START = "<tool_response>"
-    TOOL_RESPONSE_END = "</tool_response>"
+    # Fixed tokens (not customizable)
     PAD_TOKEN = "<pad>"
     UNK_TOKEN = "<unk>"
     BOS_TOKEN = "<bos>"
@@ -56,53 +119,77 @@ class SentencePieceTokenizer:
     ROLE_ASSISTANT = "assistant"
     ROLE_SYSTEM = "system"
 
-    # All user-defined special tokens (order matters for IDs)
-    USER_DEFINED_SYMBOLS = [
-        "<pad>",           # ID 0
-        "<unk>",           # ID 1
-        "<bos>",           # ID 2
-        "<eos>",           # ID 3
-        "<|im_start|>",    # ID 4
-        "<|im_end|>",      # ID 5
-        "<tools>",         # ID 6
-        "</tools>",        # ID 7
-        "<tool_call>",     # ID 8
-        "</tool_call>",    # ID 9
-        "<tool_response>", # ID 10
-        "</tool_response>",# ID 11
-        "user",            # ID 12 - role token
-        "assistant",       # ID 13 - role token
-        "system",          # ID 14 - role token
-    ]
-
-    # System prompt template for tool-calling (Hermes format)
-    SYSTEM_PROMPT_TEMPLATE = """You are a helpful assistant.
-
-# Tools
-
-You may call one or more functions to assist with the user query.
-
-You are provided with function signatures within <tools></tools> XML tags:
-<tools>
-{tools}
-</tools>
-
-For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:
-<tool_call>
-{{"name": "function_name", "arguments": {{"arg1": "value1"}}}}
-</tool_call>"""
-
     def __init__(
         self,
         model_path: Optional[str] = None,
         vocab_size: int = 8000,
+        special_tokens_file: Optional[str] = None,
     ):
         """
         Args:
             model_path: Path to pre-trained SentencePiece model (.model file).
                        If None, must call train() before using.
             vocab_size: Vocabulary size for training (ignored if loading model)
+            special_tokens_file: Path to text file with special tokens (one per line).
+                                If None, uses default tokens.
         """
+        # Load special tokens from file or use defaults
+        if special_tokens_file is not None and os.path.exists(special_tokens_file):
+            tokens = load_special_tokens_from_file(special_tokens_file)
+        else:
+            tokens = DEFAULT_SPECIAL_TOKENS
+
+        # Set instance attributes for special tokens
+        self.IM_START = tokens["IM_START"]
+        self.IM_END = tokens["IM_END"]
+        self.TOOLS_START = tokens["TOOLS_START"]
+        self.TOOLS_END = tokens["TOOLS_END"]
+        self.TOOL_CALL_START = tokens["TOOL_CALL_START"]
+        self.TOOL_CALL_END = tokens["TOOL_CALL_END"]
+        self.TOOL_RESPONSE_START = tokens["TOOL_RESPONSE_START"]
+        self.TOOL_RESPONSE_END = tokens["TOOL_RESPONSE_END"]
+        self.ADDITIONAL_TOKENS = tokens.get("ADDITIONAL_TOKENS", [])
+
+        # Build user-defined symbols list dynamically (order matters for IDs)
+        self.USER_DEFINED_SYMBOLS = [
+            self.PAD_TOKEN,           # ID 0
+            self.UNK_TOKEN,           # ID 1
+            self.BOS_TOKEN,           # ID 2
+            self.EOS_TOKEN,           # ID 3
+            self.IM_START,            # ID 4
+            self.IM_END,              # ID 5
+            self.TOOLS_START,         # ID 6
+            self.TOOLS_END,           # ID 7
+            self.TOOL_CALL_START,     # ID 8
+            self.TOOL_CALL_END,       # ID 9
+            self.TOOL_RESPONSE_START, # ID 10
+            self.TOOL_RESPONSE_END,   # ID 11
+            self.ROLE_USER,           # ID 12 - role token
+            self.ROLE_ASSISTANT,      # ID 13 - role token
+            self.ROLE_SYSTEM,         # ID 14 - role token
+        ]
+        # Add any additional tokens (e.g., {, }, " for JSON structure)
+        # These get IDs starting from 15
+        self.USER_DEFINED_SYMBOLS.extend(self.ADDITIONAL_TOKENS)
+
+        # System prompt template for tool-calling (Hermes format)
+        # Uses the loaded special tokens dynamically
+        self.SYSTEM_PROMPT_TEMPLATE = f"""You are a helpful assistant.
+
+# Tools
+
+You may call one or more functions to assist with the user query.
+
+You are provided with function signatures within {self.TOOLS_START}{self.TOOLS_END} XML tags:
+{self.TOOLS_START}
+{{tools}}
+{self.TOOLS_END}
+
+For each function call, return a json object with function name and arguments within {self.TOOL_CALL_START}{self.TOOL_CALL_END} XML tags:
+{self.TOOL_CALL_START}
+{{"name": "function_name", "arguments": {{"arg1": "value1"}}}}
+{self.TOOL_CALL_END}"""
+
         self.model_path = model_path
         self.target_vocab_size = vocab_size
         self.sp_model: Optional[spm.SentencePieceProcessor] = None
@@ -156,13 +243,22 @@ For each function call, return a json object with function name and arguments wi
             # Train SentencePiece model
             model_prefix_path = os.path.join(output_dir, model_prefix)
 
-            # Build user_defined_symbols string
-            user_defined_symbols = ",".join(self.USER_DEFINED_SYMBOLS)
+            # Build user_defined_symbols list (skip first 4: pad, unk, bos, eos)
+            # Note: Cannot include "," or '"' as they conflict with comma-separated format
+            # These characters are common enough that SentencePiece will learn them naturally
+            symbols_to_add = []
+            for symbol in self.USER_DEFINED_SYMBOLS[4:]:
+                if symbol in (',', '"'):
+                    continue  # Skip problematic characters
+                symbols_to_add.append(symbol)
+
+            user_defined_symbols = ",".join(symbols_to_add)
 
             log(f"Training SentencePiece model...",
                 vocab_size=vocab_size,
                 model_type=model_type,
-                character_coverage=character_coverage)
+                character_coverage=character_coverage,
+                user_defined_symbols_count=len(symbols_to_add))
 
             spm.SentencePieceTrainer.train(
                 input=temp_path,
@@ -179,8 +275,8 @@ For each function call, return a json object with function name and arguments wi
                 unk_piece=self.UNK_TOKEN,
                 bos_piece=self.BOS_TOKEN,
                 eos_piece=self.EOS_TOKEN,
-                # User-defined symbols (will be assigned IDs starting from 4)
-                user_defined_symbols=user_defined_symbols[len("<pad>,<unk>,<bos>,<eos>,"):],  # Skip first 4
+                # User-defined symbols (excluding "," and '"' which conflict with separator)
+                user_defined_symbols=user_defined_symbols,
                 # Training options
                 normalization_rule_name="identity",  # Don't normalize (preserve case, etc.)
                 remove_extra_whitespaces=False,

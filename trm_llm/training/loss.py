@@ -348,7 +348,8 @@ def compute_valid_tool_call_format_accuracy(
     targets: Dict[str, torch.Tensor],
     tokenizer,
     return_counts: bool = False,
-    return_sample: bool = False
+    return_sample: bool = False,
+    return_tokens: bool = False
 ):
     """Compute accuracy of generating tool calls with exact format
 
@@ -364,45 +365,44 @@ def compute_valid_tool_call_format_accuracy(
         tokenizer: Tokenizer for decoding tokens
         return_counts: If True, return (valid_count, total_count) for proper aggregation
         return_sample: If True, also return sample_correct_prediction
+        return_tokens: If True, also return decoded tokens list (token-by-token)
 
     Returns:
-        If return_counts=False, return_sample=False: accuracy (float)
-        If return_counts=True, return_sample=False: (valid_count, total_count)
-        If return_counts=False, return_sample=True: (accuracy, sample_text)
-        If return_counts=True, return_sample=True: (valid_count, total_count, sample_text)
+        Base returns depend on return_counts and return_sample flags.
+        If return_tokens=True, additionally appends (sample_decoded_tokens, target_decoded_tokens)
     """
     import re
 
+    def _make_return(accuracy_or_counts, sample=None, target=None, sample_tokens=None, target_tokens=None):
+        """Helper to construct return value based on flags"""
+        result = accuracy_or_counts if isinstance(accuracy_or_counts, tuple) else (accuracy_or_counts,)
+        if return_sample:
+            result = result + (sample, target)
+        if return_tokens:
+            result = result + (sample_tokens, target_tokens)
+        # Flatten single value
+        if len(result) == 1:
+            return result[0]
+        return result
+
     if tokenizer is None:
-        if return_counts and return_sample:
-            return 0, 0, None
-        elif return_counts:
-            return 0, 0
-        elif return_sample:
-            return 0.0, None
-        return 0.0
+        if return_counts:
+            return _make_return((0, 0))
+        return _make_return(0.0)
 
     final_outputs = outputs_per_step[-1]
 
     # Only check tool_call examples
     tool_mask = (targets['target_action'] == 1)
     if not tool_mask.any():
-        if return_counts and return_sample:
-            return 0, 0, None
-        elif return_counts:
-            return 0, 0
-        elif return_sample:
-            return 0.0, None
-        return 0.0
+        if return_counts:
+            return _make_return((0, 0))
+        return _make_return(0.0)
 
     if 'generation_logits' not in final_outputs:
-        if return_counts and return_sample:
-            return 0, 0, None
-        elif return_counts:
-            return 0, 0
-        elif return_sample:
-            return 0.0, None
-        return 0.0
+        if return_counts:
+            return _make_return((0, 0))
+        return _make_return(0.0)
 
     gen_logits = final_outputs['generation_logits']  # (batch_size, seq_len, vocab_size)
     gen_mask = targets['generation_mask']  # (batch_size, seq_len)
@@ -413,6 +413,12 @@ def compute_valid_tool_call_format_accuracy(
     valid_count = 0
     total_count = 0
     sample_correct = None  # Store first correct prediction
+    sample_target = None   # Store corresponding target
+    sample_decoded_tokens = None  # Store decoded tokens list
+    target_decoded_tokens = None  # Store target decoded tokens list
+
+    # Get target generation tokens for comparison
+    target_gen_ids = targets.get('target_generation_ids', None)
 
     # Pattern: exactly <tool_call>{...}</tool_call> with optional whitespace
     # Allows single object {...} or array [{...}, {...}]
@@ -442,19 +448,24 @@ def compute_valid_tool_call_format_accuracy(
                 json_content = match.group(1)
                 json.loads(json_content)
                 valid_count += 1
-                # Store first correct prediction
+                # Store first correct prediction and its target
                 if sample_correct is None:
                     sample_correct = text.strip()
+                    # Decode each token individually for debugging
+                    sample_decoded_tokens = [tokenizer.decode([t]) for t in tokens]
+                    # Decode target for this sample
+                    if target_gen_ids is not None:
+                        target_mask = gen_mask[i].bool()
+                        target_tokens_list = target_gen_ids[i][target_mask].tolist()
+                        if target_tokens_list:
+                            sample_target = tokenizer.decode(target_tokens_list, skip_special_tokens=False).strip()
+                            target_decoded_tokens = [tokenizer.decode([t]) for t in target_tokens_list]
 
         except (json.JSONDecodeError, Exception):
             pass
 
     accuracy = valid_count / total_count if total_count > 0 else 0.0
 
-    if return_counts and return_sample:
-        return valid_count, total_count, sample_correct
-    elif return_counts:
-        return valid_count, total_count
-    elif return_sample:
-        return accuracy, sample_correct
-    return accuracy
+    if return_counts:
+        return _make_return((valid_count, total_count), sample_correct, sample_target, sample_decoded_tokens, target_decoded_tokens)
+    return _make_return(accuracy, sample_correct, sample_target, sample_decoded_tokens, target_decoded_tokens)
