@@ -119,6 +119,12 @@ def parse_args():
         "--learning_rate", type=float, default=1e-4, help="Learning rate for AdamW (default: 1e-4)"
     )
     parser.add_argument(
+        "--warmup_steps",
+        type=int,
+        default=1000,
+        help="Number of warmup steps for LR scheduler (default: 1000)",
+    )
+    parser.add_argument(
         "--optimizer",
         type=str,
         default="adamw",
@@ -174,6 +180,40 @@ def parse_args():
         help="Label smoothing for generation loss (default: 0.1, 0.0 = no smoothing)",
     )
     parser.add_argument(
+        "--use_focal_loss",
+        action="store_true",
+        default=True,
+        help="Use Focal Loss for action classification (default: True, better for class imbalance)",
+    )
+    parser.add_argument(
+        "--no_focal_loss",
+        action="store_true",
+        help="Disable Focal Loss, use CrossEntropy instead",
+    )
+    parser.add_argument(
+        "--focal_gamma",
+        type=float,
+        default=2.0,
+        help="Focal Loss gamma parameter (default: 2.0, higher = more focus on hard examples). "
+             "For FP16, use 1.0-1.5 for better numerical stability.",
+    )
+    parser.add_argument(
+        "--action_class_weights",
+        type=float,
+        nargs=2,
+        default=None,
+        metavar=("DIRECT", "TOOL"),
+        help="Manual class weights for action loss: [direct_answer_weight, tool_call_weight]. "
+             "Example: --action_class_weights 0.3 0.7 (give 70%% weight to tool_call). "
+             "If not set, weights are auto-computed from batch frequencies.",
+    )
+    parser.add_argument(
+        "--num_calls_loss_weight",
+        type=float,
+        default=1.0,
+        help="Weight for num_calls loss (default: 1.0, set to 0 to disable for single-call datasets)",
+    )
+    parser.add_argument(
         "--use_ema",
         action="store_true",
         help="Enable EMA (Exponential Moving Average) for stable recursive depth",
@@ -200,6 +240,27 @@ def parse_args():
         "--no_flash_attention",
         action="store_true",
         help="Disable Flash Attention (use standard nn.MultiheadAttention)",
+    )
+
+    # Staged training
+    parser.add_argument(
+        "--training_stage",
+        type=int,
+        default=-1,
+        choices=[-1, 0, 1, 2],
+        help="Training stage: -1=standard, 0=backbone+heads, 1=generation, 2=finetune (default: -1)",
+    )
+    parser.add_argument(
+        "--stage_checkpoint",
+        type=str,
+        default=None,
+        help="Path to checkpoint from previous stage (required for stages 1-2)",
+    )
+    parser.add_argument(
+        "--finetune_data_path",
+        type=str,
+        default=None,
+        help="Path to smaller dataset for stage 2 fine-tuning (uses --data_path if not provided)",
     )
 
     # System
@@ -235,6 +296,12 @@ def parse_args():
         action="store_true",
         help="Skip computing dataset statistics (faster startup for large datasets)",
     )
+    parser.add_argument(
+        "--stats_num_workers",
+        type=int,
+        default=0,
+        help="Number of workers for parallel tokenization in stats computation (default: 0 = sequential)",
+    )
 
     # Distributed training (DDP)
     parser.add_argument(
@@ -267,6 +334,17 @@ def parse_args():
         default=2,
         choices=[0, 1, 2, 3],
         help="DeepSpeed ZeRO stage (default: 2). 0=disabled, 1=optimizer, 2=optimizer+gradients, 3=full",
+    )
+    parser.add_argument(
+        "--use_bf16",
+        action="store_true",
+        default=True,
+        help="Use BF16 mixed precision (default: True, more stable than FP16)",
+    )
+    parser.add_argument(
+        "--use_fp16",
+        action="store_true",
+        help="Use FP16 mixed precision instead of BF16 (less stable but wider GPU support)",
     )
 
     return parser.parse_args()
@@ -310,6 +388,16 @@ def main():
         # Update device to use local GPU
         args.device = f"cuda:{local_rank}"
 
+    # Validate staged training arguments
+    if args.training_stage in [1, 2] and not args.stage_checkpoint:
+        raise ValueError(f"--stage_checkpoint is required for training stage {args.training_stage}")
+
+    # Use finetune data path for stage 2 if provided
+    data_path = args.data_path
+    if args.training_stage == 2 and args.finetune_data_path:
+        data_path = args.finetune_data_path
+        log("Using fine-tune dataset for stage 2", path=data_path)
+
     log("TRM-LLM Training started")
 
     # Prepare DeepSpeed config if using DeepSpeed
@@ -319,17 +407,42 @@ def main():
             ds_config = args.ds_config  # Path to config file
         else:
             # Build config from arguments
+            # Use BF16 by default (more stable than FP16, especially with Focal Loss)
+            # --use_fp16 overrides --use_bf16
+            use_bf16 = args.use_bf16 and not args.use_fp16
+
+            # Warn if using FP16 with high focal_gamma
+            if not use_bf16 and args.use_focal_loss and not args.no_focal_loss:
+                if args.focal_gamma > 1.5:
+                    log_warning(
+                        "FP16 with high focal_gamma may cause loss scale issues. "
+                        "Consider using --focal_gamma 1.0 for better stability.",
+                        focal_gamma=args.focal_gamma,
+                    )
+
             ds_config = {
                 "train_micro_batch_size_per_gpu": args.batch_size,
                 "gradient_accumulation_steps": 1,
                 "gradient_clipping": 1.0,
+                "bf16": {
+                    "enabled": use_bf16
+                },
                 "fp16": {
-                    "enabled": True,
-                    "loss_scale": 0,
-                    "loss_scale_window": 1000,
-                    "initial_scale_power": 16,
-                    "hysteresis": 2,
-                    "min_loss_scale": 1
+                    "enabled": not use_bf16,
+                    "loss_scale": 0,  # Dynamic loss scaling
+                    "loss_scale_window": 2000,  # More steps before scaling adjustment (stability)
+                    "initial_scale_power": 16,  # Higher initial scale (65536)
+                    "hysteresis": 4,  # More stable scaling decisions
+                    "min_loss_scale": 1  # Minimum scale before failing
+                },
+                "scheduler": {
+                    "type": "WarmupDecayLR",
+                    "params": {
+                        "warmup_min_lr": 0,
+                        "warmup_max_lr": args.learning_rate,
+                        "warmup_num_steps": args.warmup_steps,
+                        "total_num_steps": args.warmup_steps + 100000  # Will be updated in trainer
+                    }
                 },
                 "zero_optimization": {
                     "stage": args.zero_stage,
@@ -376,6 +489,17 @@ def main():
         train_config["learning_rate"] = args.learning_rate
     if args.use_ema:
         train_config.update({"use_ema": True, "ema_decay": args.ema_decay})
+    if args.training_stage >= 0:
+        train_config.update({
+            "training_stage": args.training_stage,
+            "stage_checkpoint": args.stage_checkpoint,
+        })
+    if args.use_focal_loss and not args.no_focal_loss:
+        train_config.update({
+            "focal_loss": True,
+            "focal_gamma": args.focal_gamma,
+            "action_class_weights": args.action_class_weights if args.action_class_weights else "auto",
+        })
 
     log("Training configuration", **train_config)
 
@@ -398,10 +522,17 @@ def main():
         direct_answer_gen_weight=args.direct_answer_gen_weight,
         special_token_weight=args.special_token_weight,
         label_smoothing=args.label_smoothing,
+        # Focal Loss options
+        use_focal_loss=args.use_focal_loss and not args.no_focal_loss,
+        focal_gamma=args.focal_gamma,
+        action_class_weights=tuple(args.action_class_weights) if args.action_class_weights else None,
+        num_calls_loss_weight=args.num_calls_loss_weight,
         # Architecture options
         use_causal_encoder=args.use_causal_encoder,
         detach_between_steps=not args.no_detach,
         use_flash_attention=not args.no_flash_attention,
+        # Staged training
+        training_stage=args.training_stage,
     )
 
     # Print estimated parameters
@@ -422,9 +553,10 @@ def main():
     is_main = (rank == 0)
 
     if args.sp_model and os.path.exists(args.sp_model):
-        # Load pre-trained SentencePiece model
+        # Load pre-trained SentencePiece model (all processes load, only main logs)
         tokenizer.load(args.sp_model)
-        log("SentencePiece model loaded", path=args.sp_model, vocab_size=tokenizer.vocab_size)
+        if is_main:
+            log("SentencePiece model loaded", path=args.sp_model, vocab_size=tokenizer.vocab_size)
     else:
         # Train SentencePiece model from dataset (only on rank 0)
         sp_model_path = os.path.join(args.save_dir, "sp_tokenizer.model")
@@ -459,15 +591,17 @@ def main():
 
     config.vocab_size = tokenizer.vocab_size
 
-    # Load dataset
+    # Load dataset (only compute stats on main process)
     train_dataset = ToolCallDataset(
-        args.data_path,
+        data_path,
         tokenizer,
         max_length=args.max_seq_len,
         max_generation_len=args.max_generation_len,
         compute_stats=not args.skip_stats,
+        is_main_process=is_main,
+        num_workers=args.stats_num_workers,
     )
-    log("Training dataset loaded", path=args.data_path, examples=len(train_dataset))
+    log("Training dataset loaded", path=data_path, examples=len(train_dataset))
 
     # Log dataset statistics
     if train_dataset.stats:
@@ -577,7 +711,7 @@ def main():
         )
     log("Training sample", **sample_info)
 
-    # Load validation dataset
+    # Load validation dataset (skip stats for validation)
     val_dataset = None
     if args.eval_path:
         val_dataset = ToolCallDataset(
@@ -585,6 +719,8 @@ def main():
             tokenizer,
             max_length=args.max_seq_len,
             max_generation_len=args.max_generation_len,
+            compute_stats=False,  # Skip stats for validation dataset
+            is_main_process=is_main,
         )
         log("Validation dataset loaded", path=args.eval_path, examples=len(val_dataset))
     elif args.val_split > 0:
@@ -644,11 +780,9 @@ def main():
     # Initialize model (train from scratch, no pretrained weights)
     model = TRMLLM(config)
 
-    actual_params = model.get_num_trainable_params()
-    log("Model initialized", trainable_params=f"{actual_params / 1e6:.1f}M")
-
+    # Log parameter breakdown (only on main process)
     if is_main_process():
-        print(model)
+        model.log_param_breakdown()
 
     # Get tool mapping from dataset (handle Subset case from random_split)
     base_dataset = train_dataset.dataset if hasattr(train_dataset, "dataset") else train_dataset
@@ -674,12 +808,21 @@ def main():
         ds_config=ds_config,
         use_ema=args.use_ema,
         ema_decay=args.ema_decay,
+        training_stage=args.training_stage,
     )
 
-    # Resume from checkpoint if provided
-    if args.resume:
+    # Load checkpoint from previous stage or resume
+    if args.stage_checkpoint:
+        log("Loading checkpoint from previous stage", path=args.stage_checkpoint, stage=args.training_stage)
+        trainer.load_checkpoint_for_stage(args.stage_checkpoint, args.training_stage)
+    elif args.resume:
         log("Resuming from checkpoint", path=args.resume)
         trainer.load_checkpoint(args.resume)
+
+    # Log param breakdown after freezing is applied (for staged training)
+    if args.training_stage >= 0 and is_main_process():
+        log(f"Parameter breakdown after stage {args.training_stage} freezing:")
+        trainer.raw_model.log_param_breakdown()
 
     # Save tool mapping and config for inference (only on main process)
     import json
@@ -710,6 +853,7 @@ def main():
             "world_size": world_size,
             "use_ema": args.use_ema,
             "ema_decay": args.ema_decay if args.use_ema else None,
+            "training_stage": args.training_stage,
         }
         training_args_path = os.path.join(args.save_dir, "training_args.json")
         with open(training_args_path, "w") as f:

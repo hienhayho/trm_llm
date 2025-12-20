@@ -5,9 +5,104 @@ Implements multi-step supervision losses for deep supervision training
 
 import json
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from typing import List, Dict, Tuple, Optional
 from trm_llm.utils.config import TRMLLMConfig
+
+
+class FocalLoss(nn.Module):
+    """Focal Loss for handling class imbalance (FP16-safe implementation)
+
+    FL(p_t) = -α_t * (1 - p_t)^γ * log(p_t)
+
+    Where:
+    - p_t is the probability of the correct class
+    - γ (gamma) focuses on hard examples (higher = more focus on hard)
+    - α_t is the class weight for balancing
+
+    This implementation is numerically stable for FP16 mixed precision training:
+    - Clamps pt to prevent underflow in (1-pt)^gamma
+    - Uses stable log computation
+    - Adds epsilon for numerical safety
+
+    Reference: "Focal Loss for Dense Object Detection" (Lin et al., 2017)
+    """
+
+    def __init__(
+        self,
+        gamma: float = 2.0,
+        alpha: torch.Tensor = None,
+        reduction: str = 'mean',
+        eps: float = 1e-6,
+        pt_clamp_min: float = 1e-4,
+        pt_clamp_max: float = 1.0 - 1e-4,
+    ):
+        """
+        Args:
+            gamma: Focusing parameter. Higher values focus more on hard examples.
+                   gamma=0 is equivalent to CrossEntropyLoss. Default: 2.0
+            alpha: Class weights tensor of shape (num_classes,). Default: None (uniform)
+            reduction: 'none', 'mean', or 'sum'. Default: 'mean'
+            eps: Small epsilon for numerical stability. Default: 1e-6
+            pt_clamp_min: Minimum value for pt clamping (prevents log(0)). Default: 1e-4
+            pt_clamp_max: Maximum value for pt clamping (prevents (1-pt)^gamma underflow). Default: 0.9999
+        """
+        super().__init__()
+        self.gamma = gamma
+        self.alpha = alpha
+        self.reduction = reduction
+        self.eps = eps
+        self.pt_clamp_min = pt_clamp_min
+        self.pt_clamp_max = pt_clamp_max
+
+    def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            inputs: Logits of shape (N, C) where C is number of classes
+            targets: Ground truth labels of shape (N,)
+
+        Returns:
+            Focal loss value
+        """
+        # Compute log softmax for numerical stability (better than softmax + log)
+        log_probs = F.log_softmax(inputs, dim=-1)
+
+        # Get log probability of correct class: log(pt)
+        log_pt = log_probs.gather(dim=-1, index=targets.unsqueeze(-1)).squeeze(-1)
+
+        # Compute pt = exp(log_pt) with clamping for FP16 stability
+        # Clamp to prevent:
+        # - pt too close to 0: log(pt) -> -inf
+        # - pt too close to 1: (1-pt)^gamma underflows in FP16
+        pt = torch.exp(log_pt).clamp(min=self.pt_clamp_min, max=self.pt_clamp_max)
+
+        # Compute focal weight: (1 - pt)^gamma
+        # The clamping ensures (1-pt) >= pt_clamp_min, so this won't underflow
+        focal_weight = (1.0 - pt) ** self.gamma
+
+        # Compute cross entropy: -log(pt)
+        # Clamp log_pt to prevent -inf
+        ce_loss = -log_pt.clamp(min=-100.0)
+
+        # Apply class weights if provided
+        if self.alpha is not None:
+            if self.alpha.device != inputs.device:
+                self.alpha = self.alpha.to(inputs.device)
+            alpha_t = self.alpha[targets]
+            focal_loss = alpha_t * focal_weight * ce_loss
+        else:
+            focal_loss = focal_weight * ce_loss
+
+        # Add small epsilon to prevent zero gradients
+        focal_loss = focal_loss + self.eps
+
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
 
 
 def compute_trm_loss(
@@ -56,18 +151,60 @@ def compute_trm_loss(
     num_steps = len(outputs_per_step)
     tool_mask = (targets['target_action'] == 1)  # tool_call examples
 
+    # Get class weights for action loss (handle imbalanced datasets)
+    # If action_class_weights is provided in config, use it
+    # Otherwise compute from batch or use uniform weights
+    action_class_weights = getattr(config, 'action_class_weights', None)
+    if action_class_weights is not None:
+        # Use provided weights: [direct_answer_weight, tool_call_weight]
+        action_weight_tensor = torch.tensor(action_class_weights, device=targets['target_action'].device)
+    else:
+        # Compute weights from batch to handle imbalance
+        # More weight to minority class
+        num_direct = (targets['target_action'] == 0).sum().float()
+        num_tool = (targets['target_action'] == 1).sum().float()
+        total = num_direct + num_tool
+        if num_direct > 0 and num_tool > 0:
+            # Inverse frequency weighting
+            weight_direct = total / (2 * num_direct)
+            weight_tool = total / (2 * num_tool)
+            action_weight_tensor = torch.tensor([weight_direct, weight_tool], device=targets['target_action'].device)
+        else:
+            action_weight_tensor = None
+
+    # Check if num_calls loss should be computed (disabled if all samples have same num_calls)
+    num_calls_loss_weight = getattr(config, 'num_calls_loss_weight', 1.0)
+
+    # Use Focal Loss for action classification (better for class imbalance)
+    use_focal_loss = getattr(config, 'use_focal_loss', True)
+    focal_gamma = getattr(config, 'focal_gamma', 2.0)
+
+    if use_focal_loss:
+        action_loss_fn = FocalLoss(gamma=focal_gamma, alpha=action_weight_tensor)
+    else:
+        action_loss_fn = None  # Use standard cross entropy
+
     for step_idx, outputs in enumerate(outputs_per_step):
         # ===== 1. Action Classification Loss =====
         # Should the model answer directly or call a tool?
-        action_loss = F.cross_entropy(
-            outputs['action_logits'],
-            targets['target_action']
-        )
+        # Uses Focal Loss (default) or CrossEntropy with class weights
+        if use_focal_loss:
+            action_loss = action_loss_fn(
+                outputs['action_logits'],
+                targets['target_action']
+            )
+        else:
+            action_loss = F.cross_entropy(
+                outputs['action_logits'],
+                targets['target_action'],
+                weight=action_weight_tensor
+            )
 
         # ===== 2. Number of Parallel Calls Loss =====
         # How many tools to call in parallel? (only for tool_call examples)
+        # Can be disabled via num_calls_loss_weight=0 if dataset has no parallel calls
         num_calls_loss = torch.tensor(0.0, device=action_loss.device)
-        if tool_mask.any() and 'num_calls_logits' in outputs and 'target_num_calls' in targets:
+        if num_calls_loss_weight > 0 and tool_mask.any() and 'num_calls_logits' in outputs and 'target_num_calls' in targets:
             # target_num_calls is 1-indexed (1, 2, 3, ...), logits are 0-indexed
             # So we subtract 1 from target to get the class index
             target_num_calls_idx = targets['target_num_calls'][tool_mask] - 1
@@ -171,7 +308,8 @@ def compute_trm_loss(
         direct_answer_gen_weight = getattr(config, 'direct_answer_gen_weight', 1.0)
         consistency_loss_weight = getattr(config, 'consistency_loss_weight', 1.0)  # Weight for action-generation alignment
 
-        step_loss = (action_loss_weight * action_loss + num_calls_loss +
+        step_loss = (action_loss_weight * action_loss +
+                     num_calls_loss_weight * num_calls_loss +
                      config.halt_loss_weight * halt_loss +
                      tool_call_gen_weight * tool_call_gen_loss +
                      direct_answer_gen_weight * direct_answer_gen_loss +
@@ -195,24 +333,71 @@ def compute_action_accuracy(
     outputs_per_step: List[Dict[str, torch.Tensor]],
     targets: Dict[str, torch.Tensor]
 ) -> Dict[str, float]:
-    """Compute accuracy metrics
+    """Compute accuracy and F1 metrics for imbalanced datasets
 
     Args:
         outputs_per_step: List of model outputs
         targets: Ground truth targets
 
     Returns:
-        metrics: Dict with accuracy metrics
+        metrics: Dict with accuracy and F1 metrics including:
+            - action_accuracy: Overall accuracy
+            - direct_answer_acc: Accuracy for direct_answer class (class 0)
+            - tool_call_acc: Accuracy for tool_call class (class 1)
+            - direct_answer_precision, direct_answer_recall, direct_answer_f1
+            - tool_call_precision, tool_call_recall, tool_call_f1
+            - macro_f1: Average F1 across classes
     """
     # Use final step for evaluation
     final_outputs = outputs_per_step[-1]
 
-    # Action accuracy
+    # Action predictions and targets
     pred_action = final_outputs['action_logits'].argmax(dim=-1)
-    action_acc = (pred_action == targets['target_action']).float().mean().item()
+    target_action = targets['target_action']
+
+    # Overall action accuracy
+    action_acc = (pred_action == target_action).float().mean().item()
+
+    # Per-class metrics
+    # Class 0: direct_answer, Class 1: tool_call
+    direct_mask = (target_action == 0)  # True labels for direct_answer
+    tool_mask = (target_action == 1)    # True labels for tool_call
+
+    pred_direct = (pred_action == 0)    # Predicted as direct_answer
+    pred_tool = (pred_action == 1)      # Predicted as tool_call
+
+    # Per-class accuracy (recall per class)
+    direct_answer_acc = 0.0
+    tool_call_acc = 0.0
+
+    if direct_mask.sum() > 0:
+        direct_answer_acc = (pred_action[direct_mask] == 0).float().mean().item()
+    if tool_mask.sum() > 0:
+        tool_call_acc = (pred_action[tool_mask] == 1).float().mean().item()
+
+    # Precision, Recall, F1 for each class
+    # direct_answer (class 0)
+    tp_direct = (pred_direct & direct_mask).sum().float()
+    fp_direct = (pred_direct & tool_mask).sum().float()  # Predicted direct but was tool
+    fn_direct = (pred_tool & direct_mask).sum().float()  # Predicted tool but was direct
+
+    direct_precision = (tp_direct / (tp_direct + fp_direct)).item() if (tp_direct + fp_direct) > 0 else 0.0
+    direct_recall = (tp_direct / (tp_direct + fn_direct)).item() if (tp_direct + fn_direct) > 0 else 0.0
+    direct_f1 = (2 * direct_precision * direct_recall / (direct_precision + direct_recall)) if (direct_precision + direct_recall) > 0 else 0.0
+
+    # tool_call (class 1)
+    tp_tool = (pred_tool & tool_mask).sum().float()
+    fp_tool = (pred_tool & direct_mask).sum().float()  # Predicted tool but was direct
+    fn_tool = (pred_direct & tool_mask).sum().float()  # Predicted direct but was tool
+
+    tool_precision = (tp_tool / (tp_tool + fp_tool)).item() if (tp_tool + fp_tool) > 0 else 0.0
+    tool_recall = (tp_tool / (tp_tool + fn_tool)).item() if (tp_tool + fn_tool) > 0 else 0.0
+    tool_f1 = (2 * tool_precision * tool_recall / (tool_precision + tool_recall)) if (tool_precision + tool_recall) > 0 else 0.0
+
+    # Macro F1 (average of per-class F1)
+    macro_f1 = (direct_f1 + tool_f1) / 2
 
     # Num calls accuracy (only for tool_call examples)
-    tool_mask = (targets['target_action'] == 1)
     num_calls_acc = 0.0
     if tool_mask.any() and 'num_calls_logits' in final_outputs and 'target_num_calls' in targets:
         pred_num_calls = final_outputs['num_calls_logits'].argmax(dim=-1) + 1  # 0-indexed to 1-indexed
@@ -248,7 +433,6 @@ def compute_action_accuracy(
                     tool_gen_acc = tool_gen_acc.item()
 
             # Direct answer samples accuracy
-            direct_mask = (targets['target_action'] == 0)
             if direct_mask.any():
                 direct_mask_expanded = direct_mask.unsqueeze(1).expand(-1, seq_len)
                 direct_combined_mask = shift_mask.bool() & direct_mask_expanded
@@ -258,9 +442,23 @@ def compute_action_accuracy(
                     direct_gen_acc = direct_gen_acc.item()
 
     return {
+        # Overall metrics
         'action_accuracy': action_acc,
-        'num_calls_accuracy': num_calls_acc,
         'overall_accuracy': overall_acc,
+        'macro_f1': macro_f1,
+        # Per-class accuracy
+        'direct_answer_acc': direct_answer_acc,
+        'tool_call_acc': tool_call_acc,
+        # direct_answer metrics
+        'direct_answer_precision': direct_precision,
+        'direct_answer_recall': direct_recall,
+        'direct_answer_f1': direct_f1,
+        # tool_call metrics
+        'tool_call_precision': tool_precision,
+        'tool_call_recall': tool_recall,
+        'tool_call_f1': tool_f1,
+        # Other metrics
+        'num_calls_accuracy': num_calls_acc,
         'tool_gen_accuracy': tool_gen_acc,
         'direct_gen_accuracy': direct_gen_acc,
     }

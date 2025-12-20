@@ -288,6 +288,70 @@ class TRMLLM(nn.Module):
         """Count trainable parameters"""
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
 
+    def get_param_breakdown(self) -> dict:
+        """Get parameter count breakdown by component
+
+        Returns:
+            dict with parameter counts for each component (in millions)
+        """
+        def count_params(module):
+            return sum(p.numel() for p in module.parameters())
+
+        def count_trainable(module):
+            return sum(p.numel() for p in module.parameters() if p.requires_grad)
+
+        breakdown = {
+            "token_embedding": count_params(self.token_embedding),
+            "position_embedding": count_params(self.position_embedding),
+            "encoder": count_params(self.encoder),
+            "reasoning_module": count_params(self.reasoning_module),
+            "action_module": count_params(self.action_module),
+            "output_heads": count_params(self.output_heads),
+            "generation_head": count_params(self.generation_head),
+            "init_y": self.init_y.numel(),
+        }
+
+        # Calculate totals
+        breakdown["total"] = sum(breakdown.values())
+        breakdown["trainable"] = self.get_num_trainable_params()
+
+        # Add trainable breakdown
+        breakdown["trainable_breakdown"] = {
+            "token_embedding": count_trainable(self.token_embedding),
+            "position_embedding": count_trainable(self.position_embedding),
+            "encoder": count_trainable(self.encoder),
+            "reasoning_module": count_trainable(self.reasoning_module),
+            "action_module": count_trainable(self.action_module),
+            "output_heads": count_trainable(self.output_heads),
+            "generation_head": count_trainable(self.generation_head),
+            "init_y": self.init_y.numel() if self.init_y.requires_grad else 0,
+        }
+
+        return breakdown
+
+    def log_param_breakdown(self):
+        """Log parameter breakdown to console"""
+        breakdown = self.get_param_breakdown()
+
+        print("\n" + "=" * 60)
+        print("MODEL PARAMETER BREAKDOWN")
+        print("=" * 60)
+        print(f"{'Component':<25} {'Total':>12} {'Trainable':>12}")
+        print("-" * 60)
+
+        trainable = breakdown["trainable_breakdown"]
+        for key in ["token_embedding", "position_embedding", "encoder",
+                    "reasoning_module", "action_module", "output_heads",
+                    "generation_head", "init_y"]:
+            total = breakdown[key]
+            train = trainable[key]
+            frozen_marker = "" if train == total else " (frozen)" if train == 0 else " (partial)"
+            print(f"{key:<25} {total/1e6:>10.2f}M {train/1e6:>10.2f}M{frozen_marker}")
+
+        print("-" * 60)
+        print(f"{'TOTAL':<25} {breakdown['total']/1e6:>10.2f}M {breakdown['trainable']/1e6:>10.2f}M")
+        print("=" * 60 + "\n")
+
 
 class TRMLLMWithCache(TRMLLM):
     """TRM-LLM with KV-cache for efficient inference

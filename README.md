@@ -13,11 +13,17 @@ TRM-LLM applies the key innovations from [Tiny Recursive Models](https://arxiv.o
 
 ## Key Features
 
-- 🔄 **Recursive refinement** - Iteratively improve decisions about which action to take
-- 📊 **Deep supervision** - Multi-step training with supervision at each iteration
-- ⚡ **Adaptive computation time** - Dynamic number of refinement steps based on difficulty
-- 💾 **Parameter efficient** - Achieve competitive performance with 100M-500M params
-- 🛠️ **Tool calling focus** - Specialized for deciding when and how to use tools
+- **Recursive refinement** - Iteratively improve decisions about which action to take
+- **Deep supervision** - Multi-step training with supervision at each iteration
+- **Adaptive computation time (ACT)** - Dynamic number of refinement steps based on difficulty
+- **Parameter efficient** - Achieve competitive performance with 100M-500M params
+- **Tool calling focus** - Specialized for deciding when and how to use tools
+- **Multi-GPU training** - DDP and DeepSpeed ZeRO support
+- **Staged training pipeline** - Train backbone and generation head separately
+- **Muon optimizer** - Fast convergence for large matrix parameters
+- **EMA (Exponential Moving Average)** - Stable training for recursive models
+- **Focal Loss** - Handle imbalanced datasets (tool_call vs direct_answer)
+- **SentencePiece tokenizer** - Train custom tokenizer from your data
 
 ## Installation
 
@@ -30,9 +36,6 @@ cd trm_llm
 
 # Install dependencies with uv
 uv sync
-
-# Or install in editable mode
-uv pip install -e .
 ```
 
 ## Quick Start
@@ -41,11 +44,21 @@ uv pip install -e .
 
 Create a JSONL file where each line is a conversation with tools:
 
-```jsonl
-{"tools": "[{\"name\": \"calculator\", \"description\": \"...\", \"parameters\": {...}}]", "messages": [{"role": "user", "content": "What is 25 * 47?"}, {"role": "tool_call", "content": "{\"name\": \"calculator\", \"arguments\": {\"a\": 25, \"b\": 47, \"op\": \"multiply\"}}"}, {"role": "tool_response", "content": "{\"result\": 1175}"}, {"role": "assistant", "content": "The result is 1175."}]}
+```json
+{
+  "tools": "[{\"name\": \"calculator\", \"description\": \"Perform calculations\", \"parameters\": {\"expression\": {\"type\": \"string\"}}}]",
+  "messages": [
+    {"role": "user", "content": "What is 25 * 47?"},
+    {"role": "tool_call", "content": "{\"name\": \"calculator\", \"arguments\": {\"expression\": \"25 * 47\"}}"},
+    {"role": "tool_response", "content": "{\"result\": 1175}"},
+    {"role": "assistant", "content": "The result is 1175."}
+  ]
+}
 ```
 
 ### 2. Train the Model
+
+Basic training (single GPU):
 
 ```bash
 uv run scripts/train.py \
@@ -63,13 +76,7 @@ uv run scripts/inference.py \
     --checkpoint checkpoints/best_model.pt \
     --interactive
 
-# Single query
-uv run scripts/inference.py \
-    --checkpoint checkpoints/best_model.pt \
-    --query "What is the weather in Beijing?" \
-    --tools tools.json
-
-# Analyze refinement process
+# Single query with analysis
 uv run scripts/inference.py \
     --checkpoint checkpoints/best_model.pt \
     --query "Calculate 123 * 456" \
@@ -82,65 +89,254 @@ TRM-LLM consists of:
 
 ```
 Input (user query + tools)
-  ↓
-Encoder (12-layer Transformer, 768-dim)
-  ↓
+  |
+  v
+Encoder (Transformer, configurable layers/dim)
+  |
+  v
 Deep Supervision Loop (2-8 steps):
-  ├─ Recursive Reasoning Module
-  │   └─ Refine reasoning state z (n=3 times)
-  ├─ Action State Module
-  │   └─ Update action state y based on z
-  └─ Output Heads
-      ├─ Action: direct_answer vs tool_call
-      ├─ Tool Selection: which tool to use
-      └─ Halt: should we stop refining?
+  |-- Recursive Reasoning Module
+  |     \-- Refine reasoning state z (n times)
+  |-- Action State Module
+  |     \-- Update action state y based on z
+  \-- Output Heads
+        |-- Action: direct_answer vs tool_call
+        |-- Num Calls: how many parallel tool calls
+        |-- Halt: should we stop refining?
+        \-- Generation Head: generate tool call JSON or direct answer
 ```
 
 ### Model Configurations
 
-| Config | Params | Hidden | Layers | Reasoning | Action | Use Case |
-|--------|--------|--------|--------|-----------|--------|----------|
-| Tiny | ~100M | 640 | 10 | 384 | 192 | Fast prototyping |
-| **Base** | **~150M** | **768** | **12** | **512** | **256** | **Recommended** |
-| Medium | ~300M | 1024 | 20 | 768 | 384 | Better accuracy |
-| Large | ~500M | 1024 | 24 | 768 | 512 | Maximum performance |
+| Config | Params | Hidden | Layers | Heads | Use Case |
+|--------|--------|--------|--------|-------|----------|
+| Small | ~50M | 512 | 8 | 4 | Fast prototyping |
+| Base | ~150M | 768 | 12 | 12 | Recommended |
+| Medium | ~300M | 1024 | 16 | 16 | Better accuracy |
+| Large | ~500M | 1024 | 24 | 16 | Maximum performance |
 
 ## Training
 
-### Basic Training
+### Single GPU Training
 
 ```bash
 uv run scripts/train.py \
     --data_path data/train.jsonl \
-    --val_split 0.1 \
+    --eval_path data/val.jsonl \
     --batch_size 8 \
-    --max_epochs 50
-```
-
-### Advanced Options
-
-```bash
-uv run scripts/train.py \
-    --data_path data/train.jsonl \
+    --max_epochs 50 \
     --hidden_dim 768 \
     --num_layers 12 \
-    --reasoning_dim 512 \
-    --action_dim 256 \
-    --num_recursions 3 \
-    --max_supervision_steps 8 \
-    --learning_rate 1e-4 \
-    --batch_size 16 \
-    --max_epochs 100 \
+    --num_heads 12 \
     --save_dir checkpoints
 ```
 
-### Resume from Checkpoint
+### Multi-GPU Training with DDP
+
+```bash
+uv run torchrun --nproc_per_node=4 scripts/train.py \
+    --data_path data/train.jsonl \
+    --batch_size 8 \
+    --max_epochs 50 \
+    --ddp \
+    --save_dir checkpoints
+```
+
+### Multi-GPU Training with DeepSpeed
+
+```bash
+deepspeed --num_gpus=4 scripts/train.py \
+    --data_path data/train.jsonl \
+    --batch_size 4 \
+    --max_epochs 50 \
+    --deepspeed \
+    --zero_stage 2 \
+    --use_bf16 \
+    --save_dir checkpoints
+```
+
+### Staged Training Pipeline
+
+TRM-LLM supports a 3-stage training pipeline for better convergence:
+
+| Stage | Description | Trains | Freezes |
+|-------|-------------|--------|---------|
+| 0 | Backbone | encoder, reasoning, action, output_heads | generation_head |
+| 1 | Generation | generation_head | all others |
+| 2 | Fine-tune | all parameters | none |
+
+```bash
+# Stage 0: Train backbone (big dataset)
+deepspeed --num_gpus=4 scripts/train.py \
+    --data_path data/train.jsonl \
+    --training_stage 0 \
+    --deepspeed --zero_stage 2 --use_bf16 \
+    --max_epochs 30 \
+    --save_dir checkpoints/stage0
+
+# Stage 1: Train generation head (big dataset)
+deepspeed --num_gpus=4 scripts/train.py \
+    --data_path data/train.jsonl \
+    --training_stage 1 \
+    --stage_checkpoint checkpoints/stage0/best_model.pt \
+    --deepspeed --zero_stage 2 --use_bf16 \
+    --max_epochs 20 \
+    --save_dir checkpoints/stage1
+
+# Stage 2: Fine-tune all (small curated dataset)
+deepspeed --num_gpus=4 scripts/train.py \
+    --data_path data/finetune.jsonl \
+    --training_stage 2 \
+    --stage_checkpoint checkpoints/stage1/best_model.pt \
+    --deepspeed --zero_stage 2 --use_bf16 \
+    --learning_rate 1e-5 \
+    --max_epochs 10 \
+    --save_dir checkpoints/stage2
+```
+
+### Handling Imbalanced Datasets
+
+For datasets with imbalanced action types (e.g., 70% direct_answer, 30% tool_call):
+
+```bash
+uv run scripts/train.py \
+    --data_path data/train.jsonl \
+    --use_focal_loss \
+    --focal_gamma 2.0 \
+    --action_class_weights 0.3 0.7 \
+    --action_loss_weight 2.0 \
+    --save_dir checkpoints
+```
+
+Options:
+- `--use_focal_loss`: Enable Focal Loss for action classification
+- `--focal_gamma`: Focus parameter (higher = more focus on hard examples, default: 2.0)
+- `--action_class_weights DIRECT TOOL`: Manual class weights (e.g., 0.3 0.7 gives 70% weight to tool_call)
+- `--action_loss_weight`: Weight for action loss vs other losses (default: 2.0)
+
+### Using Muon Optimizer
+
+Muon optimizer provides faster convergence for transformer training:
+
+```bash
+uv run scripts/train.py \
+    --data_path data/train.jsonl \
+    --optimizer muon \
+    --muon_lr 0.02 \
+    --learning_rate 1e-4 \
+    --save_dir checkpoints
+```
+
+Note: Muon requires DeepSpeed ZeRO-2 for distributed training.
+
+### Using EMA for Stable Training
+
+EMA (Exponential Moving Average) helps stabilize recursive model training:
+
+```bash
+uv run scripts/train.py \
+    --data_path data/train.jsonl \
+    --use_ema \
+    --ema_decay 0.9999 \
+    --save_dir checkpoints
+```
+
+### Custom SentencePiece Tokenizer
+
+Train a custom tokenizer from your data:
+
+```bash
+# Train new tokenizer (default)
+uv run scripts/train.py \
+    --data_path data/train.jsonl \
+    --vocab_size 12000 \
+    --save_dir checkpoints
+
+# Use pre-trained tokenizer
+uv run scripts/train.py \
+    --data_path data/train.jsonl \
+    --sp_model checkpoints/sp_tokenizer.model \
+    --save_dir checkpoints
+```
+
+### Resume Training
 
 ```bash
 uv run scripts/train.py \
     --data_path data/train.jsonl \
     --resume checkpoints/checkpoint_epoch_30.pt
 ```
+
+## Training Arguments Reference
+
+### Model Architecture
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--hidden_dim` | 768 | Hidden dimension |
+| `--num_layers` | 12 | Number of encoder layers |
+| `--num_heads` | 12 | Number of attention heads |
+| `--reasoning_dim` | 512 | Reasoning state dimension |
+| `--action_dim` | 256 | Action state dimension |
+| `--num_recursions` | 3 | Recursive refinements per step |
+| `--max_seq_len` | 2048 | Maximum input sequence length |
+| `--max_generation_len` | 512 | Maximum generation length |
+
+### Training
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--batch_size` | 8 | Batch size per GPU |
+| `--max_epochs` | 50 | Maximum training epochs |
+| `--learning_rate` | 1e-4 | Learning rate for AdamW |
+| `--optimizer` | adamw | Optimizer: adamw or muon |
+| `--muon_lr` | 0.02 | Muon learning rate for hidden weights |
+| `--max_supervision_steps` | 8 | Maximum deep supervision steps |
+
+### Loss Weights
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--action_loss_weight` | 2.0 | Weight for action classification loss |
+| `--tool_call_gen_weight` | 2.0 | Weight for tool call generation loss |
+| `--direct_answer_gen_weight` | 1.0 | Weight for direct answer generation loss |
+| `--special_token_weight` | 5.0 | Extra weight for special tokens |
+| `--label_smoothing` | 0.1 | Label smoothing for generation loss |
+| `--num_calls_loss_weight` | 1.0 | Weight for num_calls loss (0 to disable) |
+
+### Focal Loss (Imbalanced Data)
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--use_focal_loss` | True | Use Focal Loss for action classification |
+| `--no_focal_loss` | False | Disable Focal Loss |
+| `--focal_gamma` | 2.0 | Focal Loss gamma (higher = focus on hard examples) |
+| `--action_class_weights` | None | Manual class weights: DIRECT TOOL (e.g., 0.3 0.7) |
+
+### Staged Training
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--training_stage` | -1 | Stage: -1=standard, 0=backbone, 1=generation, 2=finetune |
+| `--stage_checkpoint` | None | Checkpoint from previous stage |
+| `--finetune_data_path` | None | Dataset for stage 2 fine-tuning |
+
+### Distributed Training
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--ddp` | False | Enable DDP multi-GPU training |
+| `--deepspeed` | False | Enable DeepSpeed |
+| `--zero_stage` | 2 | DeepSpeed ZeRO stage (0, 1, 2, 3) |
+| `--use_bf16` | True | Use BF16 mixed precision |
+| `--use_fp16` | False | Use FP16 mixed precision |
+
+### EMA
+
+| Argument | Default | Description |
+|----------|---------|-------------|
+| `--use_ema` | False | Enable EMA |
+| `--ema_decay` | 0.9999 | EMA decay rate |
 
 ## Data Format
 
@@ -150,12 +346,12 @@ JSONL file with tool-calling conversations:
 
 ```json
 {
-  "tools": "[{\"name\": \"realtime_aqi\", \"description\": \"Get air quality\", \"parameters\": {\"city\": {\"type\": \"string\"}}}]",
+  "tools": "[{\"name\": \"get_weather\", \"description\": \"Get weather info\", \"parameters\": {\"city\": {\"type\": \"string\"}}}]",
   "messages": [
-    {"role": "user", "content": "What is the weather like in Beijing?"},
-    {"role": "tool_call", "content": "{\"name\": \"realtime_aqi\", \"arguments\": {\"city\": \"Beijing\"}}"},
-    {"role": "tool_response", "content": "{\"aqi\": \"10\", \"unit\": \"celsius\"}"},
-    {"role": "assistant", "content": "The air quality in Beijing is good with AQI of 10."}
+    {"role": "user", "content": "What is the weather in Beijing?"},
+    {"role": "tool_call", "content": "{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Beijing\"}}"},
+    {"role": "tool_response", "content": "{\"temp\": 20, \"condition\": \"sunny\"}"},
+    {"role": "assistant", "content": "The weather in Beijing is sunny with 20 degrees."}
   ]
 }
 ```
@@ -165,271 +361,155 @@ JSONL file with tool-calling conversations:
 - `user`: User's query
 - `tool_call`: Model decides to call a tool (JSON with name and arguments)
 - `tool_response`: Result from tool execution
-- `assistant`: Final text response
+- `assistant`: Final text response (direct answer without tool call)
 
-## Inference
+### Special Tokens
 
-### Interactive Mode
+Create a special tokens file (one per line):
 
-```bash
-uv run scripts/inference.py \
-    --checkpoint checkpoints/best_model.pt \
-    --interactive
+```
+<tool_call>
+</tool_call>
+<tool_response>
+</tool_response>
 ```
 
-Example session:
-```
-User: What is the weather in Beijing?
-Assistant:
-  Action: tool_call
-  Tool: realtime_aqi
-  Confidence: 0.923
-  Steps used: 3
+Use with `--special_tokens data/special_tokens.txt`.
 
-User: What is 2+2?
-Assistant:
-  Action: tool_call
-  Tool: calculator
-  Confidence: 0.987
-  Steps used: 2
-```
+## Metrics
 
-### Analyzing Refinement
+### Training Metrics
 
-See how the model progressively refines its decision:
+| Metric | Description |
+|--------|-------------|
+| `loss` | Total training loss |
+| `F1` | Macro F1 score (average of both classes) |
+| `tc_F1` | F1 score for tool_call class |
+| `da_F1` | F1 score for direct_answer class |
+| `tc_gen` | Tool call generation token accuracy |
+| `da_gen` | Direct answer generation token accuracy |
+| `tc_fmt` | Valid tool call format accuracy (JSON structure) |
 
-```bash
-uv run scripts/inference.py \
-    --checkpoint checkpoints/best_model.pt \
-    --query "Calculate 25 * 47" \
-    --analyze
-```
+### Per-Class Metrics
 
-Output:
-```
---- Refinement Analysis ---
-Step 1: tool_call (conf: 0.654, halt: 0.234)
-  → Tool: calculator (conf: 0.721)
-Step 2: tool_call (conf: 0.891, halt: 0.456)
-  → Tool: calculator (conf: 0.934)
-Step 3: tool_call (conf: 0.976, halt: 0.823)
-  → Tool: calculator (conf: 0.989)
+For imbalanced datasets, per-class metrics are more informative than overall accuracy:
 
---- Result ---
-Action: tool_call
-Tool: calculator
-Confidence: 0.965
-Steps used: 3
-```
+| Metric | Description |
+|--------|-------------|
+| `direct_answer_acc` | Accuracy on direct_answer samples |
+| `direct_answer_f1` | F1 score for direct_answer |
+| `tool_call_acc` | Accuracy on tool_call samples |
+| `tool_call_f1` | F1 score for tool_call |
+| `macro_f1` | Average F1 across classes |
 
-## Training Details
-
-### Deep Supervision
-
-The model is trained with supervision at each refinement step:
-
-```python
-for step in range(max_supervision_steps):
-    # Refine reasoning and action states
-    z = recursive_reasoning(x, y, z)
-    y = action_state(y, z)
-
-    # Compute loss at this step
-    loss = compute_loss(y, target)
-
-    # Detach for next iteration (no BPTT)
-    y, z = y.detach(), z.detach()
-```
-
-### Curriculum Learning
-
-Training gradually increases supervision steps:
-- Epochs 1-5: 2 steps
-- Epochs 6-10: 3 steps
-- Epochs 11-15: 4 steps
-- ...
-- Epochs 31+: 8 steps (maximum)
-
-### Loss Components
-
-1. **Action Loss**: CrossEntropy for direct_answer vs tool_call
-2. **Tool Loss**: CrossEntropy for which tool to select
-3. **Halt Loss**: BCE for when to stop refining
-
-Total loss = Action Loss + Tool Loss + 0.5 × Halt Loss
-
-## Expected Performance
-
-On tool-calling datasets (10K-100K examples):
-
-| Metric | Expected | Notes |
-|--------|----------|-------|
-| Action Accuracy | >90% | Correct decision to call tool or answer directly |
-| Tool Selection | >85% | Correct tool chosen when action is tool_call |
-| Overall Accuracy | >75% | Both action and tool correct |
-| Avg Steps (train) | 3-5 | With ACT early stopping |
-| Avg Steps (inference) | 2-4 | Fewer for easy queries |
+Best model is selected based on `macro_f1` (validation).
 
 ## Project Structure
 
 ```
 trm_llm/
 ├── trm_llm/
-│   ├── models/          # Model components
+│   ├── models/
 │   │   ├── trm_llm.py           # Main model
 │   │   ├── reasoning_module.py  # Recursive reasoning
 │   │   ├── action_module.py     # Action state updates
 │   │   ├── output_heads.py      # Output heads
 │   │   └── transformer_blocks.py
-│   ├── data/            # Data processing
-│   │   ├── tokenizer.py
-│   │   ├── dataset.py
-│   │   └── collator.py
-│   ├── training/        # Training utilities
-│   │   ├── trainer.py
-│   │   └── loss.py
-│   ├── inference/       # Inference engine
-│   │   └── generator.py
+│   ├── data/
+│   │   ├── sp_tokenizer.py      # SentencePiece tokenizer
+│   │   ├── dataset.py           # Dataset loading
+│   │   └── collator.py          # Batch collation
+│   ├── training/
+│   │   ├── trainer.py           # Training loop with DDP/DeepSpeed
+│   │   └── loss.py              # Loss functions (Focal Loss, etc.)
+│   ├── inference/
+│   │   └── generator.py         # Inference engine
 │   └── utils/
-│       └── config.py
+│       ├── config.py            # Configuration
+│       └── logger.py            # Structured logging
 ├── scripts/
-│   ├── train.py         # Training script
-│   └── inference.py     # Inference script
-├── pyproject.toml       # Dependencies (uv)
-└── README.md
+│   ├── train.py                 # Training script
+│   └── inference.py             # Inference script
+├── configs/
+│   └── ds_config/
+│       └── zero2.json           # DeepSpeed ZeRO-2 config
+└── pyproject.toml
 ```
 
-## Configuration
+## Troubleshooting
 
-All hyperparameters can be configured via the `TRMLLMConfig` class:
+### Out of Memory
 
-```python
-from trm_llm.utils.config import TRMLLMConfig
+```bash
+# Reduce batch size
+--batch_size 2
 
-config = TRMLLMConfig(
-    # Architecture
-    vocab_size=50257,
-    hidden_dim=768,
-    num_layers=12,
-    num_heads=12,
-    ff_dim=3072,
+# Use DeepSpeed ZeRO-2 or ZeRO-3
+--deepspeed --zero_stage 2
 
-    # TRM-specific
-    reasoning_dim=512,
-    action_dim=256,
-    num_recursions=3,
-    max_supervision_steps=8,
-
-    # Training
-    learning_rate=1e-4,
-    batch_size=8,
-    max_epochs=50,
-
-    # ACT
-    halt_threshold=0.5,
-    halt_loss_weight=0.5,
-)
+# Use gradient accumulation (via DeepSpeed config)
 ```
 
-## Advanced Usage
+### Low tool_call F1 (Imbalanced Data)
 
-### Custom Tool Definitions
-
-```python
-tools = [
-    {
-        "name": "search_web",
-        "description": "Search the internet",
-        "parameters": {
-            "query": {"type": "string", "description": "Search query"}
-        }
-    },
-    {
-        "name": "get_weather",
-        "description": "Get current weather",
-        "parameters": {
-            "city": {"type": "string"},
-            "unit": {"type": "string", "enum": ["celsius", "fahrenheit"]}
-        }
-    }
-]
+```bash
+# Use Focal Loss with class weights
+--use_focal_loss --focal_gamma 3.0 --action_class_weights 0.3 0.7
 ```
 
-### Programmatic Usage
+### FP16 Loss Scale Issues
 
-```python
-from trm_llm.models.trm_llm import TRMLLM
-from trm_llm.data.tokenizer import ToolCallTokenizer
-from trm_llm.inference.generator import TRMInference
-from trm_llm.utils.config import TRMLLMConfig
+```bash
+# Use BF16 instead (more stable)
+--use_bf16
 
-# Load model
-config = TRMLLMConfig()
-model = TRMLLM(config)
-checkpoint = torch.load('checkpoints/best_model.pt')
-model.load_state_dict(checkpoint['model_state_dict'])
+# Or lower focal_gamma for FP16
+--use_fp16 --focal_gamma 1.0
+```
 
-# Initialize inference
-tokenizer = ToolCallTokenizer()
-inference = TRMInference(model, tokenizer, config)
+### Slow Training
 
-# Set tool mapping
-inference.set_tool_mapping(tool_name_to_id)
+```bash
+# Use DeepSpeed with multiple GPUs
+deepspeed --num_gpus=4 scripts/train.py --deepspeed --zero_stage 2
 
-# Generate prediction
-result = inference.generate(
-    user_query="What's the weather in Paris?",
-    tools_json='[{"name": "get_weather", ...}]'
-)
+# Reduce max_supervision_steps
+--max_supervision_steps 4
 
-print(f"Action: {result['action']}")
-print(f"Tool: {result['tool_name']}")
-print(f"Confidence: {result['confidence']:.3f}")
+# Skip dataset statistics computation
+--skip_stats
+```
+
+### Model Collapse (Always Predicts One Class)
+
+```bash
+# Lower learning rate
+--learning_rate 5e-5
+
+# Use stronger class weights
+--action_class_weights 0.2 0.8
+
+# Increase focal_gamma
+--focal_gamma 3.0
 ```
 
 ## License
 
 MIT License
 
+## Citation
+
+If you use this code, please cite the TRM paper:
+
+```bibtex
+@article{trm2024,
+  title={Tiny Recursive Models},
+  author={...},
+  journal={arXiv preprint arXiv:2510.04871},
+  year={2024}
+}
+```
+
 ## Contributing
 
 Contributions are welcome! Please feel free to submit a Pull Request.
-
-## Troubleshooting
-
-### Out of Memory
-
-Reduce batch size or use gradient accumulation:
-```bash
-uv run scripts/train.py --batch_size 4
-```
-
-### Low Accuracy
-
-- Check data quality and format
-- Increase model size or training epochs
-- Verify tool mappings are correct
-- Use more supervision steps
-
-### Slow Training
-
-- Reduce `max_supervision_steps` during training
-- Use fewer recursions (`num_recursions=2`)
-- Enable ACT for early stopping
-
-## What's Not Included (Future Work)
-
-This is a minimal working prototype. Future extensions:
-
-- [ ] Full parameter generation (autoregressive decoder for tool arguments)
-- [ ] Full response generation (text generation for assistant responses)
-- [ ] Data augmentation strategies
-- [ ] EMA (Exponential Moving Average) for training stability
-- [ ] Multi-GPU distributed training
-- [ ] Advanced evaluation metrics
-- [ ] Integration with real tool execution
-- [ ] Multi-turn conversation support
-
-## Contact
-
-For questions or issues, please open an issue on GitHub.

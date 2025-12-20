@@ -48,6 +48,13 @@ class TRMLLMConfig:
     warmup_steps: int = 1000
     gradient_clip_norm: float = 1.0
 
+    # ===== Staged Training =====
+    # -1 = standard (all params, all losses)
+    # 0 = backbone stage (freeze generation_head, train encoder/reasoning/action/output_heads)
+    # 1 = generation stage (freeze all except generation_head)
+    # 2 = finetune stage (all params, all losses, typically with smaller dataset)
+    training_stage: int = -1
+
     # ===== Adaptive Computation Time (ACT) =====
     halt_threshold: float = 0.5  # Threshold for early stopping
     halt_loss_weight: float = 0.5  # Weight for halting loss
@@ -59,6 +66,10 @@ class TRMLLMConfig:
 
     # ===== Loss Weights =====
     action_loss_weight: float = 2.0  # Weight for action classification loss (tool_call vs direct_answer)
+    action_class_weights: tuple = None  # Class weights for action loss [direct_answer, tool_call], None = auto-compute from batch
+    use_focal_loss: bool = True  # Use Focal Loss for action classification (better for class imbalance)
+    focal_gamma: float = 2.0  # Focal Loss gamma parameter (higher = more focus on hard examples)
+    num_calls_loss_weight: float = 1.0  # Weight for num_calls loss (set to 0 if dataset has no parallel calls)
     tool_call_gen_weight: float = 2.0  # Weight for tool call JSON generation loss (higher = focus more on tool calls)
     direct_answer_gen_weight: float = 1.0  # Weight for direct answer generation loss
     special_token_weight: float = 5.0  # Extra weight for special tokens like <tool_call>, </tool_call> (improves structure)
