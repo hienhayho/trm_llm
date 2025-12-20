@@ -36,8 +36,77 @@ Final answer<|im_end|>
 """
 
 import json
+import os
 from typing import Dict, List, Optional
 from transformers import AutoTokenizer
+
+
+def load_special_tokens(filepath: str) -> Dict[str, any]:
+    """Load special tokens from a text file
+
+    The file should have one token per line in order:
+    1. IM_START (e.g., <|im_start|>)
+    2. IM_END (e.g., <|im_end|>)
+    3. TOOLS_START (e.g., <tools>)
+    4. TOOLS_END (e.g., </tools>)
+    5. TOOL_CALL_START (e.g., <tool_call>)
+    6. TOOL_CALL_END (e.g., </tool_call>)
+    7. TOOL_RESPONSE_START (e.g., <tool_response>)
+    8. TOOL_RESPONSE_END (e.g., </tool_response>)
+    9+ Additional tokens (e.g., {, }, " for JSON structure)
+
+    Args:
+        filepath: Path to the special tokens file
+
+    Returns:
+        Dict with:
+            - Named token mappings (IM_START, etc.)
+            - "ADDITIONAL_TOKENS": list of extra tokens beyond the required 8
+    """
+    token_names = [
+        "IM_START",
+        "IM_END",
+        "TOOLS_START",
+        "TOOLS_END",
+        "TOOL_CALL_START",
+        "TOOL_CALL_END",
+        "TOOL_RESPONSE_START",
+        "TOOL_RESPONSE_END",
+    ]
+
+    tokens = {}
+
+    with open(filepath, "r", encoding="utf-8") as f:
+        lines = [line.strip() for line in f if line.strip()]
+
+    if len(lines) < len(token_names):
+        raise ValueError(
+            f"Special tokens file must have at least {len(token_names)} tokens, "
+            f"but only {len(lines)} were found in {filepath}"
+        )
+
+    # Load the required named tokens
+    for i, name in enumerate(token_names):
+        tokens[name] = lines[i]
+
+    # Load any additional tokens (lines 9+)
+    tokens["ADDITIONAL_TOKENS"] = lines[len(token_names):]
+
+    return tokens
+
+
+# Default special tokens (used when no file is provided)
+DEFAULT_SPECIAL_TOKENS = {
+    "IM_START": "<|im_start|>",
+    "IM_END": "<|im_end|>",
+    "TOOLS_START": "<tools>",
+    "TOOLS_END": "</tools>",
+    "TOOL_CALL_START": "<tool_call>",
+    "TOOL_CALL_END": "</tool_call>",
+    "TOOL_RESPONSE_START": "<tool_response>",
+    "TOOL_RESPONSE_END": "</tool_response>",
+    "ADDITIONAL_TOKENS": [],  # No additional tokens by default
+}
 
 
 class ToolCallTokenizer:
@@ -52,41 +121,59 @@ class ToolCallTokenizer:
     - </tool_call>: End of tool call
     - <tool_response>: Start of tool response
     - </tool_response>: End of tool response
+
+    Special tokens can be loaded from a text file (one token per line) or
+    use defaults if no file is provided.
     """
 
-    # Hermes special tokens
-    IM_START = "<|im_start|>"
-    IM_END = "<|im_end|>"
-    TOOLS_START = "<tools>"
-    TOOLS_END = "</tools>"
-    TOOL_CALL_START = "<tool_call>"
-    TOOL_CALL_END = "</tool_call>"
-    TOOL_RESPONSE_START = "<tool_response>"
-    TOOL_RESPONSE_END = "</tool_response>"
+    def __init__(
+        self,
+        base_model: str = 'gpt2',
+        trust_remote_code: bool = True,
+        special_tokens_file: Optional[str] = None,
+    ):
+        """
+        Args:
+            base_model: HuggingFace model name for tokenizer (e.g., 'gpt2', 'Qwen/Qwen2.5-0.5B')
+            trust_remote_code: Whether to trust remote code (needed for models like Qwen)
+            special_tokens_file: Path to text file with special tokens (one per line).
+                                 If None, uses default tokens.
+        """
+        # Load special tokens from file or use defaults
+        if special_tokens_file is not None and os.path.exists(special_tokens_file):
+            tokens = load_special_tokens(special_tokens_file)
+        else:
+            tokens = DEFAULT_SPECIAL_TOKENS
 
-    # System prompt template for tool-calling (Hermes format)
-    SYSTEM_PROMPT_TEMPLATE = """You are a helpful assistant.
+        # Set instance attributes for special tokens
+        self.IM_START = tokens["IM_START"]
+        self.IM_END = tokens["IM_END"]
+        self.TOOLS_START = tokens["TOOLS_START"]
+        self.TOOLS_END = tokens["TOOLS_END"]
+        self.TOOL_CALL_START = tokens["TOOL_CALL_START"]
+        self.TOOL_CALL_END = tokens["TOOL_CALL_END"]
+        self.TOOL_RESPONSE_START = tokens["TOOL_RESPONSE_START"]
+        self.TOOL_RESPONSE_END = tokens["TOOL_RESPONSE_END"]
+        self.ADDITIONAL_TOKENS = tokens.get("ADDITIONAL_TOKENS", [])
+
+        # System prompt template for tool-calling (Hermes format)
+        # Uses the loaded special tokens
+        self.SYSTEM_PROMPT_TEMPLATE = f"""You are a helpful assistant.
 
 # Tools
 
 You may call one or more functions to assist with the user query.
 
-You are provided with function signatures within <tools></tools> XML tags:
-<tools>
-{tools}
-</tools>
+You are provided with function signatures within {self.TOOLS_START}{self.TOOLS_END} XML tags:
+{self.TOOLS_START}
+{{tools}}
+{self.TOOLS_END}
 
-For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:
-<tool_call>
+For each function call, return a json object with function name and arguments within {self.TOOL_CALL_START}{self.TOOL_CALL_END} XML tags:
+{self.TOOL_CALL_START}
 {{"name": "function_name", "arguments": {{"arg1": "value1"}}}}
-</tool_call>"""
+{self.TOOL_CALL_END}"""
 
-    def __init__(self, base_model: str = 'gpt2', trust_remote_code: bool = True):
-        """
-        Args:
-            base_model: HuggingFace model name for tokenizer (e.g., 'gpt2', 'Qwen/Qwen2.5-0.5B')
-            trust_remote_code: Whether to trust remote code (needed for models like Qwen)
-        """
         self.base_model = base_model
         self.tokenizer = AutoTokenizer.from_pretrained(
             base_model,
@@ -104,7 +191,7 @@ For each function call, return a json object with function name and arguments wi
             self.TOOL_CALL_END,
             self.TOOL_RESPONSE_START,
             self.TOOL_RESPONSE_END,
-        ]:
+        ] + self.ADDITIONAL_TOKENS:  # Include additional tokens (e.g., {, }, ")
             if token not in self.tokenizer.get_vocab():
                 tokens_to_add.append(token)
 

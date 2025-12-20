@@ -5,10 +5,82 @@ Splits each conversation into multiple decision-point samples.
 """
 
 import json
+import multiprocessing as mp
+from functools import partial
 from torch.utils.data import Dataset
 from typing import Dict, List, Optional, Tuple
+from tqdm import tqdm
 from trm_llm.data.tokenizer import ToolCallTokenizer
 from trm_llm.utils.logger import log
+
+
+def _tokenize_sample_worker(args: Tuple) -> Dict:
+    """Worker function for parallel tokenization
+
+    Args:
+        args: Tuple of (sample_dict, tokenizer, max_length, max_generation_len)
+
+    Returns:
+        Dict with token lengths for this sample
+    """
+    sample, tokenizer, max_length, max_generation_len = args
+
+    result = {
+        "input_len": 0,
+        "input_len_orig": 0,
+        "input_truncated": False,
+        "gen_len": 0,
+        "gen_len_orig": 0,
+        "gen_truncated": False,
+        "has_generation": False,
+    }
+
+    # Input tokens (with truncation)
+    input_ids = tokenizer.encode_conversation(
+        sample["tools_json"],
+        sample["context_messages"],
+        truncation=True,
+        max_length=max_length
+    )
+    result["input_len"] = len(input_ids)
+
+    # Input tokens (without truncation) - to detect truncation
+    input_ids_orig = tokenizer.encode_conversation(
+        sample["tools_json"],
+        sample["context_messages"],
+        truncation=False
+    )
+    result["input_len_orig"] = len(input_ids_orig)
+    result["input_truncated"] = len(input_ids_orig) > max_length
+
+    # Generation tokens
+    if sample.get("target_generation_content"):
+        result["has_generation"] = True
+        if sample["target_action"] == 1:  # tool_call
+            gen_ids = tokenizer.encode_tool_call(
+                sample["target_generation_content"],
+                truncation=True,
+                max_length=max_generation_len
+            )
+            gen_ids_orig = tokenizer.encode_tool_call(
+                sample["target_generation_content"],
+                truncation=False
+            )
+        else:  # direct_answer
+            gen_ids = tokenizer.encode_text(
+                sample["target_generation_content"],
+                truncation=True,
+                max_length=max_generation_len
+            )
+            gen_ids_orig = tokenizer.encode_text(
+                sample["target_generation_content"],
+                truncation=False
+            )
+        result["gen_len"] = len(gen_ids)
+        result["gen_len_orig"] = len(gen_ids_orig)
+        result["gen_truncated"] = len(gen_ids_orig) > max_generation_len
+
+    return result
 
 
 class ToolCallDataset(Dataset):
@@ -36,7 +108,9 @@ class ToolCallDataset(Dataset):
         tokenizer: ToolCallTokenizer,
         max_length: int = 2048,
         max_generation_len: int = 512,
-        compute_stats: bool = True
+        compute_stats: bool = True,
+        is_main_process: bool = True,
+        num_workers: int = 0,
     ):
         """
         Args:
@@ -45,17 +119,23 @@ class ToolCallDataset(Dataset):
             max_length: Maximum input sequence length
             max_generation_len: Maximum generation sequence length (for both tool call JSON and direct answers)
             compute_stats: Whether to compute dataset statistics (can be slow)
+            is_main_process: Whether this is the main process (only compute stats on main)
+            num_workers: Number of workers for parallel tokenization (0 = no parallelization)
         """
         self.tokenizer = tokenizer
         self.max_length = max_length
         self.max_generation_len = max_generation_len
+        self.num_workers = num_workers
+        self.is_main_process = is_main_process
 
-        # Load raw data
+        # Load raw data (only show progress on main process)
         self.raw_data = []
         with open(jsonl_path, "r") as f:
-            for line in f:
-                if line.strip():
-                    self.raw_data.append(json.loads(line))
+            lines = f.readlines()
+        iterator = tqdm(lines, desc="Loading raw data", leave=False, disable=not is_main_process)
+        for line in iterator:
+            if line.strip():
+                self.raw_data.append(json.loads(line))
 
         # Build tool name to ID mapping (across all examples)
         self.tool_name_to_id = self._build_tool_mapping()
@@ -63,8 +143,11 @@ class ToolCallDataset(Dataset):
         # Split into decision-point samples
         self.samples = self._split_into_samples()
 
-        # Statistics (can be slow for large datasets)
-        self.stats = self._compute_stats() if compute_stats else None
+        # Statistics (can be slow for large datasets, only on main process)
+        if compute_stats and is_main_process:
+            self.stats = self._compute_stats()
+        else:
+            self.stats = None
 
     def _extract_tool_name(self, tool: dict) -> Optional[str]:
         """Extract tool name from tool dict, supporting multiple formats
@@ -88,7 +171,8 @@ class ToolCallDataset(Dataset):
         """Build mapping from tool names to IDs"""
         tool_names = set()
 
-        for example in self.raw_data:
+        iterator = tqdm(self.raw_data, desc="Building tool mapping", leave=False, disable=not self.is_main_process)
+        for example in iterator:
             tools = self.tokenizer.get_tools_list(example["tools"])
             for tool in tools:
                 if isinstance(tool, str):
@@ -121,7 +205,8 @@ class ToolCallDataset(Dataset):
         """
         samples = []
 
-        for raw_idx, example in enumerate(self.raw_data):
+        iterator = tqdm(self.raw_data, desc="Splitting into samples", leave=False, disable=not self.is_main_process)
+        for raw_idx, example in enumerate(iterator):
             tools_json = example["tools"]
             messages = example["messages"]
 
@@ -257,9 +342,10 @@ class ToolCallDataset(Dataset):
         return samples
 
     def _compute_stats(self) -> Dict:
-        """Compute dataset statistics including token lengths"""
-        from tqdm import tqdm
+        """Compute dataset statistics including token lengths
 
+        Uses multiprocessing for parallel tokenization if num_workers > 0.
+        """
         tool_call_samples = sum(1 for s in self.samples if s["target_action"] == 1)
         direct_answer_samples = sum(1 for s in self.samples if s["target_action"] == 0)
 
@@ -295,54 +381,88 @@ class ToolCallDataset(Dataset):
         generation_truncated_count = 0
 
         log("  Computing token statistics...")
-        for idx in tqdm(range(len(self.samples)), desc="  Tokenizing samples", leave=False):
-            sample = self.samples[idx]
 
-            # Input tokens (with truncation)
-            input_ids = self.tokenizer.encode_conversation(
-                sample["tools_json"],
-                sample["context_messages"],
-                truncation=True,
-                max_length=self.max_length
-            )
-            input_token_lengths.append(len(input_ids))
+        if self.num_workers > 0:
+            # Parallel tokenization using multiprocessing
+            log(f"  Using {self.num_workers} workers for parallel tokenization...")
 
-            # Input tokens (without truncation) - to detect truncation
-            input_ids_orig = self.tokenizer.encode_conversation(
-                sample["tools_json"],
-                sample["context_messages"],
-                truncation=False
-            )
-            input_token_lengths_orig.append(len(input_ids_orig))
-            if len(input_ids_orig) > self.max_length:
-                input_truncated_count += 1
+            # Prepare arguments for workers
+            worker_args = [
+                (sample, self.tokenizer, self.max_length, self.max_generation_len)
+                for sample in self.samples
+            ]
 
-            # Generation tokens (tool call JSON with tags, or direct answer)
-            if sample.get("target_generation_content"):
-                if sample["target_action"] == 1:  # tool_call
-                    gen_ids = self.tokenizer.encode_tool_call(
-                        sample["target_generation_content"],
-                        truncation=True,
-                        max_length=self.max_generation_len
-                    )
-                    gen_ids_orig = self.tokenizer.encode_tool_call(
-                        sample["target_generation_content"],
-                        truncation=False
-                    )
-                else:  # direct_answer
-                    gen_ids = self.tokenizer.encode_text(
-                        sample["target_generation_content"],
-                        truncation=True,
-                        max_length=self.max_generation_len
-                    )
-                    gen_ids_orig = self.tokenizer.encode_text(
-                        sample["target_generation_content"],
-                        truncation=False
-                    )
-                generation_token_lengths.append(len(gen_ids))
-                generation_token_lengths_orig.append(len(gen_ids_orig))
-                if len(gen_ids_orig) > self.max_generation_len:
-                    generation_truncated_count += 1
+            # Use multiprocessing Pool with imap for progress bar
+            with mp.Pool(processes=self.num_workers) as pool:
+                results = list(tqdm(
+                    pool.imap(_tokenize_sample_worker, worker_args, chunksize=100),
+                    total=len(self.samples),
+                    desc="  Tokenizing samples (parallel)",
+                    leave=False
+                ))
+
+            # Aggregate results
+            for result in results:
+                input_token_lengths.append(result["input_len"])
+                input_token_lengths_orig.append(result["input_len_orig"])
+                if result["input_truncated"]:
+                    input_truncated_count += 1
+
+                if result["has_generation"]:
+                    generation_token_lengths.append(result["gen_len"])
+                    generation_token_lengths_orig.append(result["gen_len_orig"])
+                    if result["gen_truncated"]:
+                        generation_truncated_count += 1
+        else:
+            # Sequential tokenization (original behavior)
+            for idx in tqdm(range(len(self.samples)), desc="  Tokenizing samples", leave=False):
+                sample = self.samples[idx]
+
+                # Input tokens (with truncation)
+                input_ids = self.tokenizer.encode_conversation(
+                    sample["tools_json"],
+                    sample["context_messages"],
+                    truncation=True,
+                    max_length=self.max_length
+                )
+                input_token_lengths.append(len(input_ids))
+
+                # Input tokens (without truncation) - to detect truncation
+                input_ids_orig = self.tokenizer.encode_conversation(
+                    sample["tools_json"],
+                    sample["context_messages"],
+                    truncation=False
+                )
+                input_token_lengths_orig.append(len(input_ids_orig))
+                if len(input_ids_orig) > self.max_length:
+                    input_truncated_count += 1
+
+                # Generation tokens (tool call JSON with tags, or direct answer)
+                if sample.get("target_generation_content"):
+                    if sample["target_action"] == 1:  # tool_call
+                        gen_ids = self.tokenizer.encode_tool_call(
+                            sample["target_generation_content"],
+                            truncation=True,
+                            max_length=self.max_generation_len
+                        )
+                        gen_ids_orig = self.tokenizer.encode_tool_call(
+                            sample["target_generation_content"],
+                            truncation=False
+                        )
+                    else:  # direct_answer
+                        gen_ids = self.tokenizer.encode_text(
+                            sample["target_generation_content"],
+                            truncation=True,
+                            max_length=self.max_generation_len
+                        )
+                        gen_ids_orig = self.tokenizer.encode_text(
+                            sample["target_generation_content"],
+                            truncation=False
+                        )
+                    generation_token_lengths.append(len(gen_ids))
+                    generation_token_lengths_orig.append(len(gen_ids_orig))
+                    if len(gen_ids_orig) > self.max_generation_len:
+                        generation_truncated_count += 1
 
         # Unique tools
         num_unique_tools = len(self.tool_name_to_id)

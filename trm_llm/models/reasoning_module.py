@@ -11,7 +11,76 @@ The key insight from TRM paper:
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from trm_llm.models.transformer_blocks import TinyTransformer
+
+
+class AttentionPooling(nn.Module):
+    """Attention-based pooling with learnable query
+
+    Instead of mean pooling (which loses positional information),
+    this uses cross-attention with a learnable query to selectively
+    aggregate information from the sequence.
+
+    This allows the model to learn WHAT to attend to when pooling,
+    preserving important positional and content information.
+    """
+
+    def __init__(self, hidden_dim: int, num_heads: int = 8, num_queries: int = 1):
+        """
+        Args:
+            hidden_dim: Dimension of input features
+            num_heads: Number of attention heads
+            num_queries: Number of learnable query vectors (default 1 for single pooled output)
+        """
+        super().__init__()
+        self.hidden_dim = hidden_dim
+        self.num_queries = num_queries
+
+        # Learnable query vector(s)
+        self.query = nn.Parameter(torch.randn(num_queries, hidden_dim) * 0.02)
+
+        # Cross-attention: query attends to sequence
+        self.attention = nn.MultiheadAttention(
+            embed_dim=hidden_dim,
+            num_heads=num_heads,
+            batch_first=True,
+            dropout=0.1
+        )
+
+        # Layer norm for stability
+        self.norm = nn.LayerNorm(hidden_dim)
+
+    def forward(self, x: torch.Tensor, key_padding_mask: torch.Tensor = None) -> torch.Tensor:
+        """Pool sequence using attention
+
+        Args:
+            x: (batch_size, seq_len, hidden_dim) - input sequence
+            key_padding_mask: (batch_size, seq_len) - True for padding positions
+
+        Returns:
+            pooled: (batch_size, hidden_dim) if num_queries=1
+                    (batch_size, num_queries, hidden_dim) otherwise
+        """
+        batch_size = x.size(0)
+
+        # Expand query for batch
+        query = self.query.unsqueeze(0).expand(batch_size, -1, -1)  # (batch, num_queries, dim)
+
+        # Cross-attention: query attends to input sequence
+        pooled, _ = self.attention(
+            query, x, x,
+            key_padding_mask=key_padding_mask
+        )  # (batch, num_queries, dim)
+
+        # Apply layer norm
+        pooled = self.norm(pooled)
+
+        # Squeeze if single query
+        if self.num_queries == 1:
+            pooled = pooled.squeeze(1)  # (batch, dim)
+
+        return pooled
 
 
 class RecursiveReasoningModule(nn.Module):
@@ -35,7 +104,15 @@ class RecursiveReasoningModule(nn.Module):
         self.action_dim = action_dim
         self.num_recursions = num_recursions
 
-        # Project encoded input to reasoning space
+        # Attention pooling instead of mean pooling
+        # This preserves positional information by learning what to attend to
+        self.attention_pool = AttentionPooling(
+            hidden_dim=hidden_dim,
+            num_heads=8,
+            num_queries=1
+        )
+
+        # Project pooled input to reasoning space
         self.project_input = nn.Linear(hidden_dim, reasoning_dim)
 
         # Project action state to reasoning space
@@ -68,9 +145,9 @@ class RecursiveReasoningModule(nn.Module):
         batch_size = x_encoded.size(0)
         n = n_recursions if n_recursions is not None else self.num_recursions
 
-        # Project input to reasoning space (pool sequence)
-        # Average pooling over sequence length
-        x_pooled = x_encoded.mean(dim=1)  # (batch_size, hidden_dim)
+        # Pool sequence using attention (learns what to attend to)
+        # This replaces mean pooling which loses positional information
+        x_pooled = self.attention_pool(x_encoded)  # (batch_size, hidden_dim)
         x_proj = self.project_input(x_pooled)  # (batch_size, reasoning_dim)
 
         # Project action state to reasoning space
@@ -78,7 +155,8 @@ class RecursiveReasoningModule(nn.Module):
 
         # Initialize z if not provided
         if z_current is None:
-            z = torch.zeros(batch_size, self.reasoning_dim, device=x_encoded.device)
+            # Use same dtype as input to support FP16/DeepSpeed
+            z = torch.zeros(batch_size, self.reasoning_dim, device=x_encoded.device, dtype=x_encoded.dtype)
         else:
             z = z_current
 
@@ -146,7 +224,8 @@ class RecursiveReasoningWithSequence(nn.Module):
 
         # Initialize z
         if z_current is None:
-            z = torch.zeros(batch_size, seq_len, self.reasoning_dim, device=x_encoded.device)
+            # Use same dtype as input to support FP16/DeepSpeed
+            z = torch.zeros(batch_size, seq_len, self.reasoning_dim, device=x_encoded.device, dtype=x_encoded.dtype)
         else:
             z = z_current
 

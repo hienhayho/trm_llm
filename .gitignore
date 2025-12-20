@@ -217,9 +217,11 @@ __marimo__/
 
 checkpoints_*
 data/**/*.jsonl
+checkpoint_156/
 
 
 full_conversation_*
 format_*
 
 model_cache
+data_sale.json
