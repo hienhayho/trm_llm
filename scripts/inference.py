@@ -547,7 +547,7 @@ def main():
                     "step": step['step'],
                     "action": step['action'],
                     "action_confidence": f"{step['action_confidence']:.3f}",
-                    "halt_prob": f"{step['halt_prob']:.3f}",
+                    "q_prob": f"{step['q_prob']:.3f}",  # Q = correctness prediction
                 }
                 if step["action"] == "tool_call":
                     step_info["tool_name"] = step['tool_name']

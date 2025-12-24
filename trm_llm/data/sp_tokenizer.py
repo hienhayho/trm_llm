@@ -6,6 +6,7 @@ Uses Hermes chat template format for tool-calling.
 
 import json
 import os
+from tqdm import tqdm
 import tempfile
 from typing import Dict, List, Optional
 
@@ -61,7 +62,7 @@ def load_special_tokens_from_file(filepath: str) -> Dict[str, any]:
         tokens[name] = lines[i]
 
     # Load any additional tokens (lines 9+)
-    tokens["ADDITIONAL_TOKENS"] = lines[len(token_names):]
+    tokens["ADDITIONAL_TOKENS"] = lines[len(token_names) :]
 
     return tokens
 
@@ -152,21 +153,21 @@ class SentencePieceTokenizer:
 
         # Build user-defined symbols list dynamically (order matters for IDs)
         self.USER_DEFINED_SYMBOLS = [
-            self.PAD_TOKEN,           # ID 0
-            self.UNK_TOKEN,           # ID 1
-            self.BOS_TOKEN,           # ID 2
-            self.EOS_TOKEN,           # ID 3
-            self.IM_START,            # ID 4
-            self.IM_END,              # ID 5
-            self.TOOLS_START,         # ID 6
-            self.TOOLS_END,           # ID 7
-            self.TOOL_CALL_START,     # ID 8
-            self.TOOL_CALL_END,       # ID 9
-            self.TOOL_RESPONSE_START, # ID 10
-            self.TOOL_RESPONSE_END,   # ID 11
-            self.ROLE_USER,           # ID 12 - role token
-            self.ROLE_ASSISTANT,      # ID 13 - role token
-            self.ROLE_SYSTEM,         # ID 14 - role token
+            self.PAD_TOKEN,  # ID 0
+            self.UNK_TOKEN,  # ID 1
+            self.BOS_TOKEN,  # ID 2
+            self.EOS_TOKEN,  # ID 3
+            self.IM_START,  # ID 4
+            self.IM_END,  # ID 5
+            self.TOOLS_START,  # ID 6
+            self.TOOLS_END,  # ID 7
+            self.TOOL_CALL_START,  # ID 8
+            self.TOOL_CALL_END,  # ID 9
+            self.TOOL_RESPONSE_START,  # ID 10
+            self.TOOL_RESPONSE_END,  # ID 11
+            self.ROLE_USER,  # ID 12 - role token
+            self.ROLE_ASSISTANT,  # ID 13 - role token
+            self.ROLE_SYSTEM,  # ID 14 - role token
         ]
         # Add any additional tokens (e.g., {, }, " for JSON structure)
         # These get IDs starting from 15
@@ -248,17 +249,19 @@ For each function call, return a json object with function name and arguments wi
             # These characters are common enough that SentencePiece will learn them naturally
             symbols_to_add = []
             for symbol in self.USER_DEFINED_SYMBOLS[4:]:
-                if symbol in (',', '"'):
+                if symbol in (",", '"'):
                     continue  # Skip problematic characters
                 symbols_to_add.append(symbol)
 
             user_defined_symbols = ",".join(symbols_to_add)
 
-            log(f"Training SentencePiece model...",
+            log(
+                f"Training SentencePiece model...",
                 vocab_size=vocab_size,
                 model_type=model_type,
                 character_coverage=character_coverage,
-                user_defined_symbols_count=len(symbols_to_add))
+                user_defined_symbols_count=len(symbols_to_add),
+            )
 
             spm.SentencePieceTrainer.train(
                 input=temp_path,
@@ -308,7 +311,7 @@ For each function call, return a json object with function name and arguments wi
         texts = []
 
         with open(jsonl_path, "r", encoding="utf-8") as f:
-            for line in f:
+            for line in tqdm(f, desc=f"Reading {os.path.basename(jsonl_path)} ..."):
                 if not line.strip():
                     continue
 
@@ -339,9 +342,7 @@ For each function call, return a json object with function name and arguments wi
         self.sp_model.load(model_path)
         self.model_path = model_path
 
-        log(f"SentencePiece model loaded",
-            path=model_path,
-            vocab_size=self.vocab_size)
+        log(f"SentencePiece model loaded", path=model_path, vocab_size=self.vocab_size)
 
     @property
     def vocab_size(self) -> int:
@@ -401,8 +402,8 @@ For each function call, return a json object with function name and arguments wi
                         "function": {
                             "name": tool.get("name", ""),
                             "description": tool.get("description", ""),
-                            "parameters": tool.get("parameters", {})
-                        }
+                            "parameters": tool.get("parameters", {}),
+                        },
                     }
                     formatted_tools.append(json.dumps(hermes_tool))
 
@@ -510,11 +511,11 @@ For each function call, return a json object with function name and arguments wi
         text_parts = []
 
         # Check if there's a system message in the conversation
-        has_system = any(msg['role'] == 'system' for msg in messages)
+        has_system = any(msg["role"] == "system" for msg in messages)
 
         if has_system:
             for msg in messages:
-                if msg['role'] == 'system':
+                if msg["role"] == "system":
                     tools_section = f"""
 
 # Tools
@@ -530,32 +531,34 @@ For each function call, return a json object with function name and arguments wi
 <tool_call>
 {{"name": "function_name", "arguments": {{"arg1": "value1"}}}}
 </tool_call>"""
-                    system_content = msg['content'] + tools_section
-                    text_parts.append(self._format_message('system', system_content))
+                    system_content = msg["content"] + tools_section
+                    text_parts.append(self._format_message("system", system_content))
                     break
         else:
-            system_content = self.SYSTEM_PROMPT_TEMPLATE.format(tools=self._format_tools(tools_json))
-            text_parts.append(self._format_message('system', system_content))
+            system_content = self.SYSTEM_PROMPT_TEMPLATE.format(
+                tools=self._format_tools(tools_json)
+            )
+            text_parts.append(self._format_message("system", system_content))
 
         # Add other messages
         for msg in messages:
-            role = msg['role']
-            content = msg['content']
+            role = msg["role"]
+            content = msg["content"]
 
-            if role == 'system':
+            if role == "system":
                 continue
-            elif role == 'user':
-                text_parts.append(self._format_message('user', content))
-            elif role == 'tool_call':
+            elif role == "user":
+                text_parts.append(self._format_message("user", content))
+            elif role == "tool_call":
                 formatted_call = self._format_tool_call(content)
-                text_parts.append(self._format_message('assistant', formatted_call))
-            elif role == 'tool_response':
+                text_parts.append(self._format_message("assistant", formatted_call))
+            elif role == "tool_response":
                 formatted_response = self._format_tool_response(content)
-                text_parts.append(self._format_message('user', formatted_response))
-            elif role == 'assistant':
-                text_parts.append(self._format_message('assistant', content))
+                text_parts.append(self._format_message("user", formatted_response))
+            elif role == "assistant":
+                text_parts.append(self._format_message("assistant", content))
 
-        text = ''.join(text_parts)
+        text = "".join(text_parts)
         token_ids = self.encode(text, add_bos=True)  # Add BOS for input sequences
 
         if truncation and len(token_ids) > max_length:
@@ -616,7 +619,7 @@ For each function call, return a json object with function name and arguments wi
         """Extract tool name from tool call content"""
         try:
             tool_call = json.loads(tool_call_content)
-            return tool_call.get('name')
+            return tool_call.get("name")
         except json.JSONDecodeError:
             return None
 

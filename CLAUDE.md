@@ -43,7 +43,7 @@ Input → Encoder → [Recursive Reasoning (z) → Action Update (y)]×T → Out
 - `models/trm_llm.py` - Main model orchestrating the deep supervision loop
 - `models/reasoning_module.py` - Recursive refinement of reasoning state z (applied n times per supervision step)
 - `models/action_module.py` - Updates action state y based on refined z
-- `models/output_heads.py` - Decodes y into action_type (direct_answer/tool_call), tool_selection, and halt probability
+- `models/output_heads.py` - Decodes y into action_type (direct_answer/tool_call), tool_selection, and Q (correctness prediction)
 
 **Data flow:**
 1. Encoder processes input tokens → hidden states x
@@ -53,7 +53,7 @@ Input → Encoder → [Recursive Reasoning (z) → Action Update (y)]×T → Out
    - Generate outputs from y
    - Detach y, z (no BPTT across steps)
 
-**Adaptive Computation (ACT):** Model learns when to stop refinement early via halt head.
+**Adaptive Computation (ACT):** Model learns when to stop refinement early via Q-head (predicts if current answer is correct).
 
 ## Configuration Constraints
 
@@ -80,7 +80,7 @@ Roles: `user`, `tool_call`, `tool_response`, `assistant`
 ## Key Files
 
 - `trm_llm/utils/config.py` - TRMLLMConfig dataclass with all hyperparameters
-- `trm_llm/training/loss.py` - Multi-component loss (action, tool, halt)
+- `trm_llm/training/loss.py` - Multi-component loss (action, tool, Q)
 - `trm_llm/data/tokenizer.py` - GPT-2 based tokenizer with special tokens
 - `trm_llm/data/dataset.py` - Dataset loading and tool-to-ID mapping
 - `trm_llm/inference/generator.py` - TRMInference class for generation

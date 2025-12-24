@@ -202,8 +202,8 @@ class RecursiveLLM(nn.Module):
 ### 4. Adaptive Computation Time (ACT) (APPLICABLE ✓✓)
 
 **Original TRM Approach:**
-- Q-learning to decide when to halt refinement
-- Halting probability learned via binary cross-entropy
+- Q-head to decide when to stop refinement (predicts if answer is correct)
+- Q probability learned via binary cross-entropy
 - Saves compute by stopping early when answer is good
 
 **LLM Applications:**
@@ -213,16 +213,16 @@ class RecursiveLLM(nn.Module):
 class AdaptiveRefinementLLM:
     def __init__(self):
         self.refiner = RefinerModule()
-        self.halt_predictor = nn.Linear(hidden_dim, 1)
+        self.q_head = nn.Linear(hidden_dim, 1)  # Q-head predicts correctness
 
     def generate_with_act(self, prompt, max_steps=16):
         y = initial_generation(prompt)
 
         for step in range(max_steps):
-            # Predict if we should halt
-            halt_prob = torch.sigmoid(self.halt_predictor(y))
+            # Predict if answer is correct (Q-head from TRM paper)
+            q_prob = torch.sigmoid(self.q_head(y))
 
-            if halt_prob > 0.5:  # Good enough
+            if q_prob > 0.5:  # Model thinks it's correct
                 break
 
             # Otherwise refine
@@ -230,11 +230,11 @@ class AdaptiveRefinementLLM:
 
         return y, step  # Return answer and num steps used
 
-    def train_halt(self, y_pred, y_true):
-        # Train to halt when answer is correct
-        should_halt = (y_pred == y_true).float()
-        halt_loss = F.binary_cross_entropy(halt_prob, should_halt)
-        return halt_loss
+    def train_q_head(self, y_pred, y_true):
+        # Train Q-head to predict if answer is correct
+        is_correct = (y_pred == y_true).float()
+        q_loss = F.binary_cross_entropy(q_prob, is_correct)
+        return q_loss
 ```
 
 **Benefits:**
@@ -376,7 +376,7 @@ class TRMRefinementModule(nn.Module):
         super().__init__()
         self.reasoning_net = TinyTransformer(hidden_dim, num_layers)
         self.answer_net = TinyTransformer(hidden_dim, num_layers)
-        self.halt_head = nn.Linear(hidden_dim, 1)
+        self.q_head = nn.Linear(hidden_dim, 1)  # Q-head predicts correctness
 
     def forward(self, x_embed, y_embed, z_state, n_recursions=6):
         # Recursive reasoning
@@ -386,10 +386,10 @@ class TRMRefinementModule(nn.Module):
         # Update answer
         y_new = self.answer_net(y_embed, z_state)
 
-        # Halting decision
-        halt_logit = self.halt_head(y_new)
+        # Q prediction (is current answer correct?)
+        q_logit = self.q_head(y_new)
 
-        return y_new, z_state, halt_logit
+        return y_new, z_state, q_logit
 
 class LLMWithTRM(nn.Module):
     def __init__(self, base_llm, refiner_hidden_dim=512):
@@ -414,10 +414,10 @@ class LLMWithTRM(nn.Module):
 
         # Deep supervision loop
         for step in range(max_supervision_steps):
-            y, z, halt_logit = self.refiner(x, y, z)
+            y, z, q_logit = self.refiner(x, y, z)
 
-            # Check if should halt
-            if torch.sigmoid(halt_logit).mean() > 0.5:
+            # Check if model thinks answer is correct
+            if torch.sigmoid(q_logit).mean() > 0.5:
                 break
 
         # Project back and decode
@@ -452,7 +452,7 @@ class EndToEndTRMLLM(nn.Module):
         self.network = TinyTransformer(hidden_dim, num_layers)
 
         self.output_head = nn.Linear(hidden_dim, vocab_size)
-        self.halt_head = nn.Linear(hidden_dim, 1)
+        self.q_head = nn.Linear(hidden_dim, 1)  # Q-head predicts correctness
 
     def forward(self, input_ids, target_ids=None,
                 max_supervision_steps=16, n_recursions=6):
@@ -484,17 +484,17 @@ class EndToEndTRMLLM(nn.Module):
                     target_ids.view(-1)
                 )
 
-                # Halt loss
-                halt_logit = self.halt_head(y)
-                correct = (logits.argmax(-1) == target_ids).float().mean()
-                halt_loss = F.binary_cross_entropy_with_logits(
-                    halt_logit, correct.unsqueeze(-1).expand_as(halt_logit)
+                # Q loss (predict if answer is correct - TRM paper)
+                q_logit = self.q_head(y)
+                is_correct = (logits.argmax(-1) == target_ids).float().mean()
+                q_loss = F.binary_cross_entropy_with_logits(
+                    q_logit, is_correct.unsqueeze(-1).expand_as(q_logit)
                 )
 
-                total_loss += step_loss + 0.5 * halt_loss
+                total_loss += step_loss + 0.5 * q_loss
 
-                # Early stopping
-                if torch.sigmoid(halt_logit).mean() > 0.5:
+                # Early stopping (model thinks it's correct)
+                if torch.sigmoid(q_logit).mean() > 0.5:
                     break
 
             # Detach for next iteration

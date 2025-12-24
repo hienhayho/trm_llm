@@ -156,6 +156,9 @@ class ToolCallTokenizer:
         self.TOOL_RESPONSE_END = tokens["TOOL_RESPONSE_END"]
         self.ADDITIONAL_TOKENS = tokens.get("ADDITIONAL_TOKENS", [])
 
+        # BOS token for generation targets (ensures model learns to generate from scratch)
+        self.BOS_TOKEN = "<|bos|>"
+
         # System prompt template for tool-calling (Hermes format)
         # Uses the loaded special tokens
         self.SYSTEM_PROMPT_TEMPLATE = f"""You are a helpful assistant.
@@ -191,6 +194,7 @@ For each function call, return a json object with function name and arguments wi
             self.TOOL_CALL_END,
             self.TOOL_RESPONSE_START,
             self.TOOL_RESPONSE_END,
+            self.BOS_TOKEN,  # Add BOS token for generation
         ] + self.ADDITIONAL_TOKENS:  # Include additional tokens (e.g., {, }, ")
             if token not in self.tokenizer.get_vocab():
                 tokens_to_add.append(token)
@@ -215,6 +219,8 @@ For each function call, return a json object with function name and arguments wi
         # Store token IDs for easy access
         self.im_start_id = self.tokenizer.convert_tokens_to_ids(self.IM_START)
         self.im_end_id = self.tokenizer.convert_tokens_to_ids(self.IM_END)
+        self.bos_token_id = self.tokenizer.convert_tokens_to_ids(self.BOS_TOKEN)
+        self.eos_token_id = self.tokenizer.eos_token_id
 
     def _format_tools(self, tools_json: str) -> str:
         """Format tools JSON for system prompt in Hermes format
@@ -377,33 +383,51 @@ For each function call, return a json object with function name and arguments wi
 
         return token_ids
 
-    def encode_tool_call(self, tool_call_json: str, truncation: bool = True, max_length: int = 512) -> List[int]:
+    def encode_tool_call(
+        self, tool_call_json: str, truncation: bool = True, max_length: int = 512, add_bos: bool = True
+    ) -> List[int]:
         """Encode tool call JSON with Hermes format tags
 
         Args:
             tool_call_json: Tool call JSON string (single object or array)
             truncation: whether to truncate
             max_length: maximum length
+            add_bos: whether to prepend BOS token (for training generation targets)
 
         Returns:
             token_ids: List of token IDs
         """
         # Wrap in tool_call tags
         text = self._format_tool_call(tool_call_json)
-        return self.tokenizer.encode(text, truncation=truncation, max_length=max_length)
+        token_ids = self.tokenizer.encode(text, truncation=truncation, max_length=max_length)
 
-    def encode_text(self, text: str, truncation: bool = True, max_length: int = 2048) -> List[int]:
+        # Prepend BOS token for generation training
+        if add_bos:
+            token_ids = [self.bos_token_id] + token_ids
+
+        return token_ids
+
+    def encode_text(
+        self, text: str, truncation: bool = True, max_length: int = 2048, add_bos: bool = True
+    ) -> List[int]:
         """Encode plain text
 
         Args:
             text: Text to encode
             truncation: whether to truncate
             max_length: maximum length
+            add_bos: whether to prepend BOS token (for training generation targets)
 
         Returns:
             token_ids: List of token IDs
         """
-        return self.tokenizer.encode(text, truncation=truncation, max_length=max_length)
+        token_ids = self.tokenizer.encode(text, truncation=truncation, max_length=max_length)
+
+        # Prepend BOS token for generation training
+        if add_bos:
+            token_ids = [self.bos_token_id] + token_ids
+
+        return token_ids
 
     def decode(self, token_ids: List[int], skip_special_tokens: bool = False) -> str:
         """Decode token IDs to text

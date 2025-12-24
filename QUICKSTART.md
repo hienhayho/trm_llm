@@ -55,13 +55,14 @@ uv run scripts/inference.py \
 You'll see output like:
 ```
 --- Refinement Analysis ---
-Step 1: tool_call (conf: 0.654, halt: 0.234)
+Step 1: tool_call (conf: 0.654, q: 0.234)
   → Tool: calculator (conf: 0.721)
-Step 2: tool_call (conf: 0.891, halt: 0.456)
+Step 2: tool_call (conf: 0.891, q: 0.456)
   → Tool: calculator (conf: 0.934)
-Step 3: tool_call (conf: 0.976, halt: 0.823)
+Step 3: tool_call (conf: 0.976, q: 0.823)
   → Tool: calculator (conf: 0.989)
 ```
+Note: `q` is the Q-head prediction (probability that current answer is correct, from TRM paper)
 
 ## 📊 Training on Your Data
 

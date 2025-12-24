@@ -4,22 +4,98 @@ Provides rank-aware logging that only outputs on the main process (rank 0)
 when running with DDP (Distributed Data Parallel) or DeepSpeed.
 
 Usage:
-    from trm_llm.utils.logger import log
+    from trm_llm.utils.logger import log, setup_file_logging
 
+    setup_file_logging("checkpoints/train.log")  # Enable file logging
     log("Training started")  # Simple logging
 """
 
 import logging
 import os
+import re
 import sys
 import structlog
 import torch.distributed as dist
-from typing import Optional
+from datetime import datetime
+from typing import Optional, TextIO
 
 
 # Global state for rank awareness
 _is_main_process: Optional[bool] = None
 _logger_configured: bool = False
+_log_file: Optional[TextIO] = None
+_log_file_path: Optional[str] = None
+_original_stdout: Optional[TextIO] = None
+_original_stderr: Optional[TextIO] = None
+
+# Regex to strip ANSI escape codes
+_ansi_escape_pattern = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+
+
+class TeeOutput:
+    """Tee output to both terminal and file, stripping ANSI codes for file"""
+
+    def __init__(self, original_stream: TextIO, log_file: TextIO, stream_name: str = "stdout"):
+        self.original_stream = original_stream
+        self.log_file = log_file
+        self.stream_name = stream_name
+
+    def write(self, message: str) -> int:
+        # Write to original stream (terminal) with colors
+        if self.original_stream is not None:
+            try:
+                self.original_stream.write(message)
+                self.original_stream.flush()
+            except (IOError, ValueError):
+                pass
+
+        # Write to file without ANSI codes
+        if self.log_file is not None and message:
+            try:
+                clean_message = _ansi_escape_pattern.sub('', message)
+                self.log_file.write(clean_message)
+                self.log_file.flush()
+            except (IOError, ValueError):
+                pass
+
+        return len(message)
+
+    def flush(self) -> None:
+        if self.original_stream is not None:
+            try:
+                self.original_stream.flush()
+            except (IOError, ValueError):
+                pass
+        if self.log_file is not None:
+            try:
+                self.log_file.flush()
+            except (IOError, ValueError):
+                pass
+
+    def fileno(self) -> int:
+        """Return file descriptor for compatibility"""
+        if self.original_stream is not None:
+            return self.original_stream.fileno()
+        return -1
+
+    def isatty(self) -> bool:
+        """Check if stream is a TTY (for tqdm compatibility)"""
+        if self.original_stream is not None:
+            try:
+                return self.original_stream.isatty()
+            except (IOError, ValueError):
+                pass
+        return False
+
+    # Additional methods for compatibility
+    def readable(self) -> bool:
+        return False
+
+    def writable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return False
 
 
 def is_main_process() -> bool:
@@ -62,6 +138,137 @@ def reset_main_process_cache():
     """Reset the main process cache (call after DDP init)"""
     global _is_main_process
     _is_main_process = None
+
+
+def setup_file_logging(log_path: str) -> str:
+    """Setup file logging - captures ALL terminal output (stdout/stderr)
+
+    Args:
+        log_path: Path to log file (will be created if doesn't exist)
+
+    Returns:
+        Actual log file path used
+    """
+    global _log_file, _log_file_path, _logger_configured
+    global _original_stdout, _original_stderr
+
+    # Only main process should write logs
+    if not is_main_process():
+        return log_path
+
+    # Close existing log file if any
+    if _log_file is not None:
+        _log_file.close()
+
+    # Restore original streams if they were redirected
+    if _original_stdout is not None:
+        sys.stdout = _original_stdout
+    if _original_stderr is not None:
+        sys.stderr = _original_stderr
+
+    # Create directory if needed
+    log_dir = os.path.dirname(log_path)
+    if log_dir:
+        os.makedirs(log_dir, exist_ok=True)
+
+    # Open log file in append mode
+    _log_file = open(log_path, "a", encoding="utf-8")
+    _log_file_path = log_path
+
+    # Write header
+    _log_file.write(f"\n{'='*60}\n")
+    _log_file.write(f"Training started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+    _log_file.write(f"{'='*60}\n\n")
+    _log_file.flush()
+
+    # Save original streams
+    _original_stdout = sys.stdout
+    _original_stderr = sys.stderr
+
+    # Redirect stdout and stderr to TeeOutput (captures EVERYTHING)
+    sys.stdout = TeeOutput(_original_stdout, _log_file, "stdout")
+    sys.stderr = TeeOutput(_original_stderr, _log_file, "stderr")
+
+    # Reconfigure logger to use dual output
+    _logger_configured = False
+    configure_logger()
+
+    return log_path
+
+
+def close_file_logging():
+    """Close the log file and restore original stdout/stderr"""
+    global _log_file, _log_file_path
+    global _original_stdout, _original_stderr
+
+    # Restore original streams first
+    if _original_stdout is not None:
+        sys.stdout = _original_stdout
+        _original_stdout = None
+    if _original_stderr is not None:
+        sys.stderr = _original_stderr
+        _original_stderr = None
+
+    # Close log file
+    if _log_file is not None:
+        try:
+            _log_file.write(f"\n{'='*60}\n")
+            _log_file.write(f"Training ended at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n")
+            _log_file.write(f"{'='*60}\n")
+            _log_file.flush()
+            _log_file.close()
+        except (IOError, ValueError):
+            pass
+        _log_file = None
+        _log_file_path = None
+
+
+class DualPrintLogger:
+    """Logger that prints to stdout
+
+    Note: With TeeOutput redirecting stdout/stderr, all output is
+    automatically captured to the log file.
+    """
+
+    def __init__(self, file: Optional[TextIO] = None):
+        self.file = file  # Kept for compatibility but not used
+
+    def _log(self, message: str) -> None:
+        # Print to sys.stdout - TeeOutput will handle file writing automatically
+        try:
+            print(message, file=sys.stdout)
+            sys.stdout.flush()
+        except (IOError, ValueError):
+            pass
+
+    # Required methods for structlog
+    def msg(self, message: str) -> None:
+        self._log(message)
+
+    def info(self, message: str) -> None:
+        self._log(message)
+
+    def warning(self, message: str) -> None:
+        self._log(message)
+
+    def error(self, message: str) -> None:
+        self._log(message)
+
+    def debug(self, message: str) -> None:
+        self._log(message)
+
+    def critical(self, message: str) -> None:
+        self._log(message)
+
+    def __repr__(self) -> str:
+        return f"<DualPrintLogger(file={self.file})>"
+
+
+class DualLoggerFactory:
+    """Factory that creates DualPrintLogger instances"""
+
+    def __call__(self, *args) -> DualPrintLogger:
+        return DualPrintLogger(file=_log_file)
 
 
 def _filter_by_rank(logger, method_name, event_dict):
@@ -109,8 +316,8 @@ def configure_logger(
         processors=processors,
         wrapper_class=structlog.make_filtering_bound_logger(log_level),
         context_class=dict,
-        logger_factory=structlog.PrintLoggerFactory(file=sys.stdout),
-        cache_logger_on_first_use=True,
+        logger_factory=DualLoggerFactory(),
+        cache_logger_on_first_use=False,  # Don't cache so file logging can be enabled later
     )
 
     _logger_configured = True

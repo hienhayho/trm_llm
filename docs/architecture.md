@@ -33,7 +33,7 @@ flowchart TB
         y_out --> heads
 
         heads --> action_out[Action Logits]
-        heads --> halt[Halt Logit]
+        heads --> q[Q Logit]
 
         y_out -.->|detach| y_in
         z_out -.->|detach| z_in
@@ -68,5 +68,5 @@ Input → Encoder → [Reasoning(x,y,z) → Action(y,z)]×T → Output Heads →
 | **Encoder** | Transforms input tokens to hidden states x |
 | **Reasoning Module** | Recursively refines z = f(x, y, z) for n iterations |
 | **Action Module** | Updates action state y = g(y, z) |
-| **Output Heads** | Predicts action type, num calls, halt probability |
+| **Output Heads** | Predicts action type, num calls, Q (correctness prediction) |
 | **Generation Head** | Generates tool call JSON or direct answer text |
