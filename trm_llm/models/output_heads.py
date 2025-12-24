@@ -3,7 +3,7 @@
 Multiple specialized heads that decode the action state y into concrete decisions:
 1. Action Head: Should I answer directly or call a tool?
 2. Tool Selection Head: Which tool should I call?
-3. Halt Head: Should I stop refining? (ACT - Adaptive Computation Time)
+3. Q Head: Is my prediction correct? (for early stopping, following TRM paper)
 """
 
 import torch
@@ -17,7 +17,7 @@ class OutputHeads(nn.Module):
     Takes action state y and produces:
     - Action logits: [P(direct_answer), P(tool_call)]
     - Num parallel calls logits: [P(1), P(2), ..., P(max_parallel)]
-    - Halt logit: P(should_stop_refining)
+    - Q logit: P(prediction_is_correct) - following TRM paper
 
     Note: Tool selection is done via generation (model generates tool name in JSON)
     """
@@ -52,8 +52,9 @@ class OutputHeads(nn.Module):
             nn.Linear(action_dim // 2, max_parallel_calls)
         )
 
-        # 3. Halt decision head: should I stop refining? (for ACT)
-        self.halt_head = nn.Linear(action_dim, 1)
+        # 3. Q head: predicts if current prediction is correct (TRM paper)
+        # Used for early stopping: if Q > threshold, model thinks it's correct
+        self.q_head = nn.Linear(action_dim, 1)
 
     def forward(self, y_state):
         """Generate all outputs from action state
@@ -65,7 +66,7 @@ class OutputHeads(nn.Module):
             dict with:
                 - action_logits: (batch_size, num_action_types)
                 - num_calls_logits: (batch_size, max_parallel_calls)
-                - halt_logit: (batch_size, 1)
+                - q_logit: (batch_size, 1) - correctness prediction (TRM paper)
                 - y_state: (batch_size, action_dim) - for downstream use
         """
         # Action decision (direct answer vs tool call)
@@ -74,13 +75,13 @@ class OutputHeads(nn.Module):
         # Number of parallel calls (1, 2, 3, ...)
         num_calls_logits = self.num_calls_head(y_state)  # (batch_size, max_parallel_calls)
 
-        # Halting decision (should stop refining)
-        halt_logit = self.halt_head(y_state)  # (batch_size, 1)
+        # Q prediction: is the current prediction correct? (TRM paper)
+        q_logit = self.q_head(y_state)  # (batch_size, 1)
 
         return {
             'action_logits': action_logits,
             'num_calls_logits': num_calls_logits,
-            'halt_logit': halt_logit,
+            'q_logit': q_logit,
             'y_state': y_state  # Keep for generation
         }
 
@@ -96,16 +97,16 @@ class OutputHeads(nn.Module):
         logits = self.action_head(y_state)
         return F.softmax(logits, dim=-1)
 
-    def get_halt_prob(self, y_state):
-        """Get halting probability
+    def get_q_prob(self, y_state):
+        """Get Q probability (correctness prediction)
 
         Args:
             y_state: (batch_size, action_dim)
 
         Returns:
-            halt_prob: (batch_size, 1)
+            q_prob: (batch_size, 1) - probability that prediction is correct
         """
-        logit = self.halt_head(y_state)
+        logit = self.q_head(y_state)
         return torch.sigmoid(logit)
 
     def get_num_calls_probs(self, y_state):
@@ -358,7 +359,8 @@ class UnifiedGenerationHead(nn.Module):
                  top_k: int = 50,
                  top_p: float = 0.9,
                  no_repeat_ngram_size: int = 3,
-                 action_logits: torch.Tensor = None) -> torch.Tensor:
+                 action_logits: torch.Tensor = None,
+                 bos_token_id: int = None) -> torch.Tensor:
         """Generate tokens autoregressively with repetition prevention
 
         Args:
@@ -373,6 +375,7 @@ class UnifiedGenerationHead(nn.Module):
             no_repeat_ngram_size: prevent repeating n-grams of this size (0 = disabled)
             action_logits: (batch_size, num_action_types) - action prediction logits
                           for conditioning generation on predicted action
+            bos_token_id: beginning of sequence token ID (default: 0)
 
         Returns:
             generated_ids: (batch_size, seq_len)
@@ -384,8 +387,9 @@ class UnifiedGenerationHead(nn.Module):
         # Prepare memory for cross-attention (action-conditioned)
         memory = self._prepare_memory(y_state, encoder_output, action_logits)
 
-        # Start token
-        generated = torch.zeros(batch_size, 1, dtype=torch.long, device=device)
+        # Start token - use BOS token if provided, otherwise 0
+        start_token_id = bos_token_id if bos_token_id is not None else 0
+        generated = torch.full((batch_size, 1), start_token_id, dtype=torch.long, device=device)
 
         for step in range(max_length - 1):
             seq_len = generated.size(1)

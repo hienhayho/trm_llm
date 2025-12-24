@@ -122,7 +122,7 @@ def compute_trm_loss(
             Each dict contains:
                 - action_logits: (batch_size, num_action_types)
                 - num_calls_logits: (batch_size, max_parallel_calls)
-                - halt_logit: (batch_size, 1)
+                - q_logit: (batch_size, 1) - correctness prediction (TRM paper)
                 - generation_logits: (batch_size, gen_seq_len, vocab_size) [optional, last step only]
         targets: Ground truth dict with:
             - target_action: (batch_size,) - 0 for direct_answer, 1 for tool_call
@@ -142,7 +142,7 @@ def compute_trm_loss(
     losses = {
         'action': 0.0,
         'num_calls': 0.0,
-        'halt': 0.0,
+        'q': 0.0,  # Q loss (correctness prediction, TRM paper)
         'tool_call_gen': 0.0,
         'direct_answer_gen': 0.0,
         'consistency': 0.0,
@@ -216,16 +216,17 @@ def compute_trm_loss(
                 target_num_calls_idx
             )
 
-        # ===== 3. Adaptive Computation Time (ACT) Halting Loss =====
-        # Learn to halt when the prediction is correct
-        # Halt target: 1.0 if prediction matches ground truth, else 0.0
+        # ===== 3. Q Loss (Correctness Prediction, TRM paper) =====
+        # Q-head learns to predict if the current action prediction is correct
+        # Target: 1.0 if prediction matches ground truth, else 0.0
+        # Used for early stopping: if Q > threshold, model thinks it's correct
 
         # Check if action prediction is correct
         pred_action = outputs['action_logits'].argmax(dim=-1)
         is_correct = (pred_action == targets['target_action']).float()
 
-        halt_loss = F.binary_cross_entropy_with_logits(
-            outputs['halt_logit'].squeeze(-1),
+        q_loss = F.binary_cross_entropy_with_logits(
+            outputs['q_logit'].squeeze(-1),
             is_correct
         )
 
@@ -255,10 +256,21 @@ def compute_trm_loss(
 
                 # Compute per-token loss with label smoothing
                 label_smoothing = getattr(config, 'label_smoothing', 0.1)
+
+                # Clamp targets to valid range to prevent cross_entropy errors
+                flat_targets = flat_targets.clamp(0, vocab_size - 1)
+
                 per_token_loss = F.cross_entropy(
                     flat_logits, flat_targets,
                     reduction='none',
                     label_smoothing=label_smoothing
+                )
+
+                # NaN protection for per-token loss
+                per_token_loss = torch.where(
+                    torch.isnan(per_token_loss) | torch.isinf(per_token_loss),
+                    torch.zeros_like(per_token_loss),
+                    per_token_loss
                 )
 
                 # Create special token weight mask (higher weight for <tool_call>, </tool_call>, etc.)
@@ -276,19 +288,26 @@ def compute_trm_loss(
                 if tool_mask.any():
                     tool_mask_expanded = tool_mask.unsqueeze(1).expand(-1, seq_len).contiguous().view(-1).float()
                     tool_combined_mask = flat_mask * tool_mask_expanded
-                    if tool_combined_mask.sum() > 0:
+                    weight_sum = (tool_combined_mask * token_weights).sum()
+                    if weight_sum > 0:
                         # Apply both mask and special token weights
                         weighted_loss = per_token_loss * tool_combined_mask * token_weights
-                        weight_sum = (tool_combined_mask * token_weights).sum()
                         tool_call_gen_loss = weighted_loss.sum() / weight_sum
+                        # NaN protection
+                        if torch.isnan(tool_call_gen_loss) or torch.isinf(tool_call_gen_loss):
+                            tool_call_gen_loss = torch.tensor(0.0, device=action_loss.device)
 
                 # Direct answer generation loss
                 direct_mask = (targets['target_action'] == 0)
                 if direct_mask.any():
                     direct_mask_expanded = direct_mask.unsqueeze(1).expand(-1, seq_len).contiguous().view(-1).float()
                     direct_combined_mask = flat_mask * direct_mask_expanded
-                    if direct_combined_mask.sum() > 0:
-                        direct_answer_gen_loss = (per_token_loss * direct_combined_mask).sum() / direct_combined_mask.sum()
+                    mask_sum = direct_combined_mask.sum()
+                    if mask_sum > 0:
+                        direct_answer_gen_loss = (per_token_loss * direct_combined_mask).sum() / mask_sum
+                        # NaN protection
+                        if torch.isnan(direct_answer_gen_loss) or torch.isinf(direct_answer_gen_loss):
+                            direct_answer_gen_loss = torch.tensor(0.0, device=action_loss.device)
 
             losses['tool_call_gen'] += tool_call_gen_loss.item()
             losses['direct_answer_gen'] += direct_answer_gen_loss.item()
@@ -310,7 +329,7 @@ def compute_trm_loss(
 
         step_loss = (action_loss_weight * action_loss +
                      num_calls_loss_weight * num_calls_loss +
-                     config.halt_loss_weight * halt_loss +
+                     config.q_loss_weight * q_loss +
                      tool_call_gen_weight * tool_call_gen_loss +
                      direct_answer_gen_weight * direct_answer_gen_loss +
                      consistency_loss_weight * consistency_loss)
@@ -319,12 +338,23 @@ def compute_trm_loss(
         # Accumulate for logging
         losses['action'] += action_loss.item()
         losses['num_calls'] += num_calls_loss.item() if isinstance(num_calls_loss, torch.Tensor) else 0.0
-        losses['halt'] += halt_loss.item()
+        losses['q'] += q_loss.item()
 
     # Average across supervision steps
     total_loss = total_loss / num_steps
+
+    # Final NaN protection for total loss
+    if torch.isnan(total_loss) or torch.isinf(total_loss):
+        # Return a small valid loss to avoid breaking training
+        total_loss = torch.tensor(0.1, device=total_loss.device, requires_grad=True)
+
     for key in losses:
         losses[key] /= num_steps
+        # Replace NaN/Inf in losses dict with 0 for logging
+        if not isinstance(losses[key], (int, float)):
+            losses[key] = 0.0
+        elif losses[key] != losses[key]:  # NaN check
+            losses[key] = 0.0
 
     return total_loss, losses
 

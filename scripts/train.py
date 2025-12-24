@@ -29,6 +29,7 @@ import torch
 from torch.utils.data import DataLoader, random_split
 from torch.utils.data.distributed import DistributedSampler
 import os
+from pathlib import Path
 
 from trm_llm.models.trm_llm import TRMLLM
 from trm_llm.data.dataset import ToolCallDataset
@@ -36,7 +37,21 @@ from trm_llm.data.sp_tokenizer import SentencePieceTokenizer
 from trm_llm.data.collator import DataCollator
 from trm_llm.training.trainer import TRMTrainer, setup_distributed, cleanup_distributed
 from trm_llm.utils.config import TRMLLMConfig
-from trm_llm.utils.logger import log, log_warning, reset_main_process_cache, is_main_process
+from trm_llm.utils.logger import (
+    log,
+    log_warning,
+    reset_main_process_cache,
+    is_main_process,
+    setup_file_logging,
+    close_file_logging,
+)
+
+# Optional wandb import
+try:
+    import wandb
+    WANDB_AVAILABLE = True
+except ImportError:
+    WANDB_AVAILABLE = False
 
 
 def parse_args():
@@ -125,6 +140,12 @@ def parse_args():
         help="Number of warmup steps for LR scheduler (default: 1000)",
     )
     parser.add_argument(
+        "--weight_decay",
+        type=float,
+        default=0.01,
+        help="Weight decay for AdamW optimizer (default: 0.01, try 0.001 for stability)",
+    )
+    parser.add_argument(
         "--optimizer",
         type=str,
         default="adamw",
@@ -193,9 +214,10 @@ def parse_args():
     parser.add_argument(
         "--focal_gamma",
         type=float,
-        default=2.0,
-        help="Focal Loss gamma parameter (default: 2.0, higher = more focus on hard examples). "
-             "For FP16, use 1.0-1.5 for better numerical stability.",
+        default=1.5,
+        help="Focal Loss gamma parameter (default: 1.5, higher = more focus on hard examples). "
+        "For FP16/BF16 mixed precision, use 1.0-1.5 for better numerical stability. "
+        "Higher values (2.0+) can cause loss spikes in later epochs.",
     )
     parser.add_argument(
         "--action_class_weights",
@@ -204,8 +226,8 @@ def parse_args():
         default=None,
         metavar=("DIRECT", "TOOL"),
         help="Manual class weights for action loss: [direct_answer_weight, tool_call_weight]. "
-             "Example: --action_class_weights 0.3 0.7 (give 70%% weight to tool_call). "
-             "If not set, weights are auto-computed from batch frequencies.",
+        "Example: --action_class_weights 0.3 0.7 (give 70%% weight to tool_call). "
+        "If not set, weights are auto-computed from batch frequencies.",
     )
     parser.add_argument(
         "--num_calls_loss_weight",
@@ -240,6 +262,37 @@ def parse_args():
         "--no_flash_attention",
         action="store_true",
         help="Disable Flash Attention (use standard nn.MultiheadAttention)",
+    )
+    parser.add_argument(
+        "--use_step_embedding_in",
+        action="store_true",
+        help="Add step embedding BEFORE recursive loop (input context: 'processing at step N')",
+    )
+    parser.add_argument(
+        "--use_step_embedding_out",
+        action="store_true",
+        help="Add step embedding AFTER recursive loop (output labeling: 'produced at step N')",
+    )
+
+    # Original TRM gradient flow options
+    parser.add_argument(
+        "--deep_recursion_steps",
+        type=int,
+        default=1,
+        help="T parameter: number of deep recursion iterations within each supervision step (default: 1). "
+        "Original TRM paper uses T=3. Set to 1 to disable deep recursion.",
+    )
+    parser.add_argument(
+        "--use_original_trm_grad",
+        action="store_true",
+        help="Use original TRM gradient flow: T-1 iterations without grad, 1 with grad, then detach. "
+        "Matches the TRM paper's pseudocode. Requires --deep_recursion_steps > 1 for effect.",
+    )
+    parser.add_argument(
+        "--use_original_trm_training",
+        action="store_true",
+        help="Use original TRM training loop: backward/step after EACH supervision step (not accumulated). "
+        "Matches the TRM paper's training procedure. Best used with --use_original_trm_grad.",
     )
 
     # Staged training
@@ -289,7 +342,21 @@ def parse_args():
         help="Log sample prediction every N steps (default: 0 = only at end of epoch)",
     )
     parser.add_argument(
+        "--early_stopping_patience",
+        type=int,
+        default=0,
+        help="Stop training if validation F1 doesn't improve for N epochs (default: 0 = disabled). "
+        "Recommended: 5-10 for preventing overfitting in staged training.",
+    )
+    parser.add_argument(
         "--resume", type=str, default=None, help="Path to checkpoint to resume from"
+    )
+    parser.add_argument(
+        "--ds_checkpoint",
+        type=str,
+        default=None,
+        help="Path to DeepSpeed checkpoint directory for resuming (e.g., checkpoint_epoch_3_ds). "
+        "Use this instead of --resume for proper scheduler/optimizer restoration with DeepSpeed.",
     )
     parser.add_argument(
         "--skip_stats",
@@ -314,6 +381,38 @@ def parse_args():
         type=int,
         default=-1,
         help="Local rank for DDP (automatically set by torchrun, do not set manually)",
+    )
+
+    # Weights & Biases logging
+    parser.add_argument(
+        "--wandb",
+        action="store_true",
+        help="Enable Weights & Biases logging for experiment tracking",
+    )
+    parser.add_argument(
+        "--wandb_project",
+        type=str,
+        default="trm-llm",
+        help="W&B project name (default: trm-llm)",
+    )
+    parser.add_argument(
+        "--wandb_run_name",
+        type=str,
+        default=None,
+        help="W&B run name (default: auto-generated)",
+    )
+    parser.add_argument(
+        "--wandb_entity",
+        type=str,
+        default=None,
+        help="W&B entity (team or username, default: your default entity)",
+    )
+    parser.add_argument(
+        "--wandb_tags",
+        type=str,
+        nargs="*",
+        default=None,
+        help="W&B tags for the run (e.g., --wandb_tags experiment1 baseline)",
     )
 
     # DeepSpeed
@@ -352,6 +451,19 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    # Setup file logging at the very start (before any other logs)
+    # Check rank from environment for distributed training
+    save_dir = Path(args.save_dir)
+    env_rank = int(os.environ.get("RANK", os.environ.get("LOCAL_RANK", 0)))
+    if env_rank == 0:  # Only main process
+        save_dir.mkdir(parents=True, exist_ok=True)
+        from datetime import datetime
+
+        log_filename = f"train_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
+        log_path = save_dir / log_filename
+        setup_file_logging(str(log_path))
+        log("File logging enabled", log_file=str(log_path))
 
     # Initialize distributed training if requested
     rank, world_size, use_ddp = 0, 1, False
@@ -411,48 +523,50 @@ def main():
             # --use_fp16 overrides --use_bf16
             use_bf16 = args.use_bf16 and not args.use_fp16
 
-            # Warn if using FP16 with high focal_gamma
-            if not use_bf16 and args.use_focal_loss and not args.no_focal_loss:
+            # Warn if using mixed precision with high focal_gamma
+            if args.use_focal_loss and not args.no_focal_loss:
                 if args.focal_gamma > 1.5:
                     log_warning(
-                        "FP16 with high focal_gamma may cause loss scale issues. "
-                        "Consider using --focal_gamma 1.0 for better stability.",
+                        "High focal_gamma with mixed precision (FP16/BF16) may cause training instability. "
+                        "Consider using --focal_gamma 1.0-1.5 for better stability.",
                         focal_gamma=args.focal_gamma,
+                        precision="bf16" if use_bf16 else "fp16",
                     )
 
             ds_config = {
                 "train_micro_batch_size_per_gpu": args.batch_size,
                 "gradient_accumulation_steps": 1,
                 "gradient_clipping": 1.0,
-                "bf16": {
-                    "enabled": use_bf16
-                },
+                "bf16": {"enabled": use_bf16},
                 "fp16": {
                     "enabled": not use_bf16,
                     "loss_scale": 0,  # Dynamic loss scaling
                     "loss_scale_window": 2000,  # More steps before scaling adjustment (stability)
                     "initial_scale_power": 16,  # Higher initial scale (65536)
                     "hysteresis": 4,  # More stable scaling decisions
-                    "min_loss_scale": 1  # Minimum scale before failing
+                    "min_loss_scale": 1,  # Minimum scale before failing
                 },
+                # Use WarmupCosineLR for smooth cosine decay with minimum LR floor
+                # cos_min_ratio=0.1 means LR never drops below 10% of initial
                 "scheduler": {
-                    "type": "WarmupDecayLR",
+                    "type": "WarmupCosineLR",
                     "params": {
-                        "warmup_min_lr": 0,
-                        "warmup_max_lr": args.learning_rate,
+                        "total_num_steps": args.warmup_steps + 100000,  # Will be updated in trainer
+                        "warmup_min_ratio": 0.0,  # Start warmup from 0
                         "warmup_num_steps": args.warmup_steps,
-                        "total_num_steps": args.warmup_steps + 100000  # Will be updated in trainer
-                    }
+                        "cos_min_ratio": 0.1,  # Minimum LR = 10% of max (prevents decay to 0)
+                        "warmup_type": "linear",  # Linear warmup (more stable than log)
+                    },
                 },
                 "zero_optimization": {
                     "stage": args.zero_stage,
                     "overlap_comm": True,
                     "contiguous_gradients": True,
                     "reduce_bucket_size": 5e8,
-                    "allgather_bucket_size": 5e8
+                    "allgather_bucket_size": 5e8,
                 },
                 "zero_allow_untested_optimizer": True,
-                "wall_clock_breakdown": False
+                "wall_clock_breakdown": False,
             }
 
     # Log training configuration
@@ -470,13 +584,15 @@ def main():
     if use_ddp:
         train_config.update({"rank": rank, "world_size": world_size, "local_rank": local_rank})
     if use_deepspeed:
-        train_config.update({
-            "deepspeed": True,
-            "zero_stage": args.zero_stage,
-            "rank": rank,
-            "world_size": world_size,
-            "local_rank": local_rank,
-        })
+        train_config.update(
+            {
+                "deepspeed": True,
+                "zero_stage": args.zero_stage,
+                "rank": rank,
+                "world_size": world_size,
+                "local_rank": local_rank,
+            }
+        )
     if args.optimizer == "muon":
         train_config.update(
             {
@@ -490,18 +606,103 @@ def main():
     if args.use_ema:
         train_config.update({"use_ema": True, "ema_decay": args.ema_decay})
     if args.training_stage >= 0:
-        train_config.update({
-            "training_stage": args.training_stage,
-            "stage_checkpoint": args.stage_checkpoint,
-        })
+        train_config.update(
+            {
+                "training_stage": args.training_stage,
+                "stage_checkpoint": args.stage_checkpoint,
+            }
+        )
     if args.use_focal_loss and not args.no_focal_loss:
+        train_config.update(
+            {
+                "focal_loss": True,
+                "focal_gamma": args.focal_gamma,
+                "action_class_weights": (
+                    args.action_class_weights if args.action_class_weights else "auto"
+                ),
+            }
+        )
+    if args.early_stopping_patience > 0:
+        train_config["early_stopping_patience"] = args.early_stopping_patience
+    if args.deep_recursion_steps > 1 or args.use_original_trm_grad or args.use_original_trm_training:
         train_config.update({
-            "focal_loss": True,
-            "focal_gamma": args.focal_gamma,
-            "action_class_weights": args.action_class_weights if args.action_class_weights else "auto",
+            "deep_recursion_steps": args.deep_recursion_steps,
+            "use_original_trm_grad": args.use_original_trm_grad,
+            "use_original_trm_training": args.use_original_trm_training,
+        })
+    if args.use_step_embedding_in or args.use_step_embedding_out:
+        train_config.update({
+            "use_step_embedding_in": args.use_step_embedding_in,
+            "use_step_embedding_out": args.use_step_embedding_out,
         })
 
     log("Training configuration", **train_config)
+
+    # Initialize wandb (only on main process)
+    wandb_run = None
+    is_main_proc = (rank == 0)  # rank is always defined (0 for single GPU)
+    if args.wandb:
+        if not WANDB_AVAILABLE:
+            log_warning("wandb is not installed. Run 'uv add wandb' to enable wandb logging.")
+        elif is_main_proc:
+            wandb_run = wandb.init(
+                project=args.wandb_project,
+                name=args.wandb_run_name,
+                entity=args.wandb_entity,
+                tags=args.wandb_tags,
+                config={
+                    # Model architecture
+                    "hidden_dim": args.hidden_dim,
+                    "num_layers": args.num_layers,
+                    "num_heads": args.num_heads,
+                    "reasoning_dim": args.reasoning_dim,
+                    "action_dim": args.action_dim,
+                    "num_recursions": args.num_recursions,
+                    "max_seq_len": args.max_seq_len,
+                    "max_generation_len": args.max_generation_len,
+                    "vocab_size": args.vocab_size,
+                    # Training
+                    "batch_size": args.batch_size,
+                    "max_epochs": args.max_epochs,
+                    "learning_rate": args.learning_rate,
+                    "weight_decay": args.weight_decay,
+                    "warmup_steps": args.warmup_steps,
+                    "optimizer": args.optimizer,
+                    "max_supervision_steps": args.max_supervision_steps,
+                    # Loss weights
+                    "action_loss_weight": args.action_loss_weight,
+                    "tool_call_gen_weight": args.tool_call_gen_weight,
+                    "direct_answer_gen_weight": args.direct_answer_gen_weight,
+                    "special_token_weight": args.special_token_weight,
+                    "label_smoothing": args.label_smoothing,
+                    "use_focal_loss": args.use_focal_loss and not args.no_focal_loss,
+                    "focal_gamma": args.focal_gamma,
+                    # Architecture options
+                    "use_causal_encoder": args.use_causal_encoder,
+                    "detach_between_steps": not args.no_detach,
+                    "use_flash_attention": not args.no_flash_attention,
+                    "use_step_embedding_in": args.use_step_embedding_in,
+                    "use_step_embedding_out": args.use_step_embedding_out,
+                    "deep_recursion_steps": args.deep_recursion_steps,
+                    "use_original_trm_grad": args.use_original_trm_grad,
+                    "use_original_trm_training": args.use_original_trm_training,
+                    # Training options
+                    "training_stage": args.training_stage,
+                    "use_ema": args.use_ema,
+                    "ema_decay": args.ema_decay if args.use_ema else None,
+                    "early_stopping_patience": args.early_stopping_patience,
+                    # Distributed
+                    "use_ddp": use_ddp,
+                    "use_deepspeed": use_deepspeed,
+                    "zero_stage": args.zero_stage if use_deepspeed else None,
+                    "world_size": world_size,
+                    # Data
+                    "data_path": args.data_path,
+                    "eval_path": args.eval_path,
+                    "val_split": args.val_split,
+                },
+            )
+            log("Weights & Biases initialized", project=args.wandb_project, run_name=wandb_run.name)
 
     # Create config
     config = TRMLLMConfig(
@@ -522,15 +723,24 @@ def main():
         direct_answer_gen_weight=args.direct_answer_gen_weight,
         special_token_weight=args.special_token_weight,
         label_smoothing=args.label_smoothing,
+        weight_decay=args.weight_decay,
         # Focal Loss options
         use_focal_loss=args.use_focal_loss and not args.no_focal_loss,
         focal_gamma=args.focal_gamma,
-        action_class_weights=tuple(args.action_class_weights) if args.action_class_weights else None,
+        action_class_weights=(
+            tuple(args.action_class_weights) if args.action_class_weights else None
+        ),
         num_calls_loss_weight=args.num_calls_loss_weight,
         # Architecture options
         use_causal_encoder=args.use_causal_encoder,
         detach_between_steps=not args.no_detach,
         use_flash_attention=not args.no_flash_attention,
+        # Step embeddings (connects latent spaces between supervision steps)
+        use_step_embedding_in=args.use_step_embedding_in,
+        use_step_embedding_out=args.use_step_embedding_out,
+        # Original TRM gradient flow options
+        deep_recursion_steps=args.deep_recursion_steps,
+        use_original_trm_grad=args.use_original_trm_grad,
         # Staged training
         training_stage=args.training_stage,
     )
@@ -550,19 +760,24 @@ def main():
         special_tokens_file=args.special_tokens,
     )
     is_distributed = use_ddp or use_deepspeed
-    is_main = (rank == 0)
+    is_main = rank == 0
 
-    if args.sp_model and os.path.exists(args.sp_model):
+    sp_model_path = Path(args.sp_model) if args.sp_model else None
+    if sp_model_path and sp_model_path.exists():
         # Load pre-trained SentencePiece model (all processes load, only main logs)
-        tokenizer.load(args.sp_model)
+        tokenizer.load(str(sp_model_path))
         if is_main:
-            log("SentencePiece model loaded", path=args.sp_model, vocab_size=tokenizer.vocab_size)
+            log(
+                "SentencePiece model loaded",
+                path=str(sp_model_path),
+                vocab_size=tokenizer.vocab_size,
+            )
     else:
         # Train SentencePiece model from dataset (only on rank 0)
-        sp_model_path = os.path.join(args.save_dir, "sp_tokenizer.model")
+        sp_model_path = save_dir / "sp_tokenizer.model"
 
         if is_main:
-            os.makedirs(args.save_dir, exist_ok=True)
+            save_dir.mkdir(parents=True, exist_ok=True)
 
             # Collect all data paths for training
             data_paths = [args.data_path]
@@ -572,7 +787,7 @@ def main():
             log("Training SentencePiece model from dataset...", data_paths=data_paths)
             sp_model_path = tokenizer.train(
                 data_paths=data_paths,
-                output_dir=args.save_dir,
+                output_dir=str(save_dir),
                 model_prefix="sp_tokenizer",
                 vocab_size=args.vocab_size,
             )
@@ -581,13 +796,18 @@ def main():
         # Synchronize in distributed mode - other processes wait and then load
         if is_distributed:
             import torch.distributed as dist
+
             # Initialize process group for DeepSpeed if not already done
             if use_deepspeed and not dist.is_initialized():
                 dist.init_process_group(backend="nccl")
             dist.barrier()
             if not is_main:
-                tokenizer.load(sp_model_path)
-                log("SentencePiece model loaded (synced)", path=sp_model_path, vocab_size=tokenizer.vocab_size)
+                tokenizer.load(str(sp_model_path))
+                log(
+                    "SentencePiece model loaded (synced)",
+                    path=str(sp_model_path),
+                    vocab_size=tokenizer.vocab_size,
+                )
 
     config.vocab_size = tokenizer.vocab_size
 
@@ -780,9 +1000,23 @@ def main():
     # Initialize model (train from scratch, no pretrained weights)
     model = TRMLLM(config)
 
-    # Log parameter breakdown (only on main process)
+    # Log parameter breakdown and model summary (only on main process)
     if is_main_process():
         model.log_param_breakdown()
+
+        # Show model architecture summary using torchinfo (on CPU with small input to avoid OOM)
+        from torchinfo import summary
+
+        log("Model Architecture Summary:")
+        summary(
+            model,
+            input_size=(1, 1024),
+            dtypes=[torch.long],
+            device=args.device,
+            col_names=["input_size", "output_size", "num_params", "trainable"],
+            depth=4,
+            verbose=1,
+        )
 
     # Get tool mapping from dataset (handle Subset case from random_split)
     base_dataset = train_dataset.dataset if hasattr(train_dataset, "dataset") else train_dataset
@@ -809,12 +1043,28 @@ def main():
         use_ema=args.use_ema,
         ema_decay=args.ema_decay,
         training_stage=args.training_stage,
+        early_stopping_patience=args.early_stopping_patience,
+        use_original_trm_training=args.use_original_trm_training,
+        wandb_run=wandb_run,
     )
 
     # Load checkpoint from previous stage or resume
     if args.stage_checkpoint:
-        log("Loading checkpoint from previous stage", path=args.stage_checkpoint, stage=args.training_stage)
+        log(
+            "Loading checkpoint from previous stage",
+            path=args.stage_checkpoint,
+            stage=args.training_stage,
+        )
         trainer.load_checkpoint_for_stage(args.stage_checkpoint, args.training_stage)
+    elif args.ds_checkpoint:
+        # Explicit DeepSpeed checkpoint directory
+        if not use_deepspeed:
+            log_warning(
+                "--ds_checkpoint is only for DeepSpeed training. Use --resume instead.",
+                ds_checkpoint=args.ds_checkpoint,
+            )
+        log("Resuming from DeepSpeed checkpoint", path=args.ds_checkpoint)
+        trainer.load_checkpoint(args.ds_checkpoint, ds_checkpoint_dir=args.ds_checkpoint)
     elif args.resume:
         log("Resuming from checkpoint", path=args.resume)
         trainer.load_checkpoint(args.resume)
@@ -829,21 +1079,73 @@ def main():
     from dataclasses import asdict
 
     if is_main_process():
-        os.makedirs(args.save_dir, exist_ok=True)
+        save_dir.mkdir(parents=True, exist_ok=True)
 
         # Save tool mapping
-        tool_mapping_path = os.path.join(args.save_dir, "tool_mapping.json")
+        tool_mapping_path = save_dir / "tool_mapping.json"
         with open(tool_mapping_path, "w") as f:
             json.dump(base_dataset.tool_name_to_id, f, indent=2)
 
         # Save config
-        config_path = os.path.join(args.save_dir, "config.json")
+        config_path = save_dir / "config.json"
         with open(config_path, "w") as f:
             json.dump(asdict(config), f, indent=2)
 
+        # Save training command to script.sh for reproducibility
+        import sys
+
+        script_path = save_dir / "script.sh"
+        with open(script_path, "w") as f:
+            f.write("#!/bin/bash\n\n")
+            f.write("# Training command for reproducibility\n")
+            f.write("# Generated automatically by train.py\n\n")
+            # Reconstruct the command based on training mode
+            if use_deepspeed:
+                cmd_parts = [f"uv run --active deepspeed --num_gpus={world_size} scripts/train.py"]
+            elif use_ddp:
+                cmd_parts = [
+                    f"uv run --active torchrun --nproc_per_node={world_size} scripts/train.py"
+                ]
+            else:
+                cmd_parts = ["uv run --active scripts/train.py"]
+            # Group arguments with their values (e.g., --zero_stage 2 -> "--zero_stage 2")
+            argv = sys.argv[1:]
+            i = 0
+            while i < len(argv):
+                arg = argv[i]
+                # Skip local_rank as it's set by launcher
+                if arg.startswith("--local_rank"):
+                    i += 1
+                    # Skip the value if present
+                    if i < len(argv) and not argv[i].startswith("--"):
+                        i += 1
+                    continue
+                # Check if this is a flag with values
+                if arg.startswith("--"):
+                    # Collect all values (arguments that don't start with --)
+                    values = []
+                    j = i + 1
+                    while j < len(argv) and not argv[j].startswith("--"):
+                        val = argv[j]
+                        # Quote values with spaces
+                        if " " in val:
+                            val = f'"{val}"'
+                        values.append(val)
+                        j += 1
+                    if values:
+                        cmd_parts.append(f"{arg} {' '.join(values)}")
+                    else:
+                        cmd_parts.append(arg)
+                    i = j
+                else:
+                    cmd_parts.append(arg)
+                    i += 1
+            f.write(" \\\n    ".join(cmd_parts) + "\n")
+        log("Saved training command", path=script_path)
+
         # Save training args (for inference)
         training_args = {
-            "sp_model": os.path.join(args.save_dir, "sp_tokenizer.model"),
+            "sp_model": str(save_dir / "sp_tokenizer.model"),
             "vocab_size": tokenizer.vocab_size,
             "special_tokens": args.special_tokens,
             "optimizer": args.optimizer,
@@ -854,20 +1156,24 @@ def main():
             "use_ema": args.use_ema,
             "ema_decay": args.ema_decay if args.use_ema else None,
             "training_stage": args.training_stage,
+            "deep_recursion_steps": args.deep_recursion_steps,
+            "use_original_trm_grad": args.use_original_trm_grad,
+            "use_original_trm_training": args.use_original_trm_training,
         }
-        training_args_path = os.path.join(args.save_dir, "training_args.json")
+        training_args_path = save_dir / "training_args.json"
         with open(training_args_path, "w") as f:
             json.dump(training_args, f, indent=2)
 
         # Copy SentencePiece model to save_dir if it was provided externally
-        if args.sp_model and os.path.exists(args.sp_model):
-            sp_dest = os.path.join(args.save_dir, "sp_tokenizer.model")
-            if os.path.abspath(args.sp_model) != os.path.abspath(sp_dest):
-                shutil.copy(args.sp_model, sp_dest)
+        sp_src = Path(args.sp_model) if args.sp_model else None
+        if sp_src and sp_src.exists():
+            sp_dest = save_dir / "sp_tokenizer.model"
+            if sp_src.resolve() != sp_dest.resolve():
+                shutil.copy(sp_src, sp_dest)
                 # Also copy vocab file if exists
-                vocab_src = args.sp_model.replace(".model", ".vocab")
-                if os.path.exists(vocab_src):
-                    shutil.copy(vocab_src, os.path.join(args.save_dir, "sp_tokenizer.vocab"))
+                vocab_src = sp_src.with_suffix(".vocab")
+                if vocab_src.exists():
+                    shutil.copy(vocab_src, save_dir / "sp_tokenizer.vocab")
 
         log(
             "Training artifacts saved",
@@ -881,9 +1187,16 @@ def main():
     try:
         trainer.train(save_dir=args.save_dir)
     finally:
+        # Finish wandb run
+        if wandb_run is not None:
+            wandb_run.finish()
+            log("Weights & Biases run finished")
         # Clean up distributed environment
         if use_ddp:
             cleanup_distributed()
+        # Close file logging
+        if is_main_process():
+            close_file_logging()
 
 
 if __name__ == "__main__":

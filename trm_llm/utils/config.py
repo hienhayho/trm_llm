@@ -27,7 +27,13 @@ class TRMLLMConfig:
     # Recursive reasoning module
     reasoning_dim: int = 512  # Dimension for z (reasoning state)
     action_dim: int = 256  # Dimension for y (action state)
-    num_recursions: int = 3  # Number of recursive refinement steps (n)
+    num_recursions: int = 3  # Number of recursive refinement steps (n) - latent reasoning iterations
+
+    # Deep recursion (T parameter from TRM paper)
+    # Within each supervision step: T iterations of latent_recursion
+    # T-1 iterations without gradients, 1 iteration with gradients
+    deep_recursion_steps: int = 3  # T parameter (default: 3, set to 1 to disable)
+    use_original_trm_grad: bool = False  # Use original TRM gradient flow (T-1 no_grad + 1 with grad)
 
     # Deep supervision
     max_supervision_steps: int = 8  # Maximum supervision iterations during training
@@ -56,19 +62,25 @@ class TRMLLMConfig:
     training_stage: int = -1
 
     # ===== Adaptive Computation Time (ACT) =====
-    halt_threshold: float = 0.5  # Threshold for early stopping
-    halt_loss_weight: float = 0.5  # Weight for halting loss
+    q_threshold: float = 0.5  # Threshold for early stopping (Q > threshold means model thinks it's correct)
+    q_loss_weight: float = 0.5  # Weight for Q loss (correctness prediction, TRM paper)
 
     # ===== Architecture Options =====
     use_causal_encoder: bool = False  # Use causal attention in encoder (for pure LLM training)
     detach_between_steps: bool = True  # Detach states between supervision steps (original TRM behavior)
     use_flash_attention: bool = True  # Use PyTorch 2.0 SDPA for Flash Attention
 
+    # ===== Step Embeddings (connects latent spaces between supervision steps) =====
+    # PE_in: Added BEFORE recursive loop - tells model "processing at step N"
+    # PE_out: Added AFTER recursive loop - labels output "produced at step N"
+    use_step_embedding_in: bool = False  # Add step embedding to y,z BEFORE reasoning (input context)
+    use_step_embedding_out: bool = False  # Add step embedding to y,z AFTER action (output labeling)
+
     # ===== Loss Weights =====
     action_loss_weight: float = 2.0  # Weight for action classification loss (tool_call vs direct_answer)
     action_class_weights: tuple = None  # Class weights for action loss [direct_answer, tool_call], None = auto-compute from batch
     use_focal_loss: bool = True  # Use Focal Loss for action classification (better for class imbalance)
-    focal_gamma: float = 2.0  # Focal Loss gamma parameter (higher = more focus on hard examples)
+    focal_gamma: float = 1.5  # Focal Loss gamma parameter (1.5 for stability with mixed precision, higher can cause instability)
     num_calls_loss_weight: float = 1.0  # Weight for num_calls loss (set to 0 if dataset has no parallel calls)
     tool_call_gen_weight: float = 2.0  # Weight for tool call JSON generation loss (higher = focus more on tool calls)
     direct_answer_gen_weight: float = 1.0  # Weight for direct answer generation loss
@@ -116,11 +128,11 @@ class TRMLLMConfig:
         # Action module (2 layers, action_dim)
         action = 2 * (4 * self.action_dim**2 + 2 * self.action_dim * (self.action_dim * 4))
 
-        # Output heads (action, num_calls, halt - no tool_head since tool selection is via generation)
+        # Output heads (action, num_calls, q_head - no tool_head since tool selection is via generation)
         action_head = self.action_dim * self.num_action_types
         num_calls_head = self.action_dim * self.max_parallel_calls
-        halt_head = self.action_dim * 1
-        output_heads = action_head + num_calls_head + halt_head
+        q_head = self.action_dim * 1
+        output_heads = action_head + num_calls_head + q_head
 
         total = token_embed + pos_embed + encoder_total + reasoning + action + output_heads
 

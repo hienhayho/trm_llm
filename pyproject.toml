@@ -16,6 +16,8 @@ dependencies = [
     "deepspeed>=0.18.3",
     "setuptools>=75.3.2",
     "gdown>=5.2.0",
+    "torchinfo>=1.8.0",
+    "wandb>=0.23.1",
 ]
 
 [project.optional-dependencies]

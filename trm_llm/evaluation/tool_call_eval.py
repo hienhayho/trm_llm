@@ -214,7 +214,8 @@ def evaluate_sample(
     inference: TRMInference,
     sample: EvalSample,
     max_steps: Optional[int] = None,
-    parse_raw_output: bool = False
+    parse_raw_output: bool = False,
+    max_gen_len: int = 64
 ) -> EvalResult:
     """Evaluate a single sample
 
@@ -222,6 +223,8 @@ def evaluate_sample(
         inference: TRMInference instance
         sample: EvalSample to evaluate
         max_steps: Max supervision steps
+        parse_raw_output: Parse raw output for tool calls
+        max_gen_len: Max generation length for tool params
 
     Returns:
         EvalResult with prediction details
@@ -233,7 +236,7 @@ def evaluate_sample(
         max_steps=max_steps,
         generate_params=True,
         generate_response=True,
-        max_param_len=128
+        max_param_len=max_gen_len
     )
 
     predicted_action = result['action']
@@ -294,7 +297,9 @@ def evaluate_tool_call_accuracy(
     local_rank: int = -1,
     world_size: int = 1,
     parse_raw_output: bool = False,
-    verbose: bool = False
+    max_gen_len: int = 64,
+    verbose: bool = False,
+    tool_name_to_id: Optional[Dict[str, int]] = None,
 ) -> Dict:
     """Evaluate tool call generation accuracy
 
@@ -360,6 +365,31 @@ def evaluate_tool_call_accuracy(
     model.eval()
     inference = TRMInference(model, tokenizer, config, device=device)
 
+    # Set tool name mapping
+    # IMPORTANT: Must use the same mapping from training, otherwise tool IDs won't match!
+    if tool_name_to_id:
+        inference.set_tool_mapping(tool_name_to_id)
+        if verbose:
+            log(f"Tool mapping loaded from checkpoint", num_tools=len(tool_name_to_id), tools=list(tool_name_to_id.keys()))
+    else:
+        # Fallback: Build tool name mapping from samples (WARNING: may not match training!)
+        log_warning("No tool_name_to_id provided! Building from samples - this may not match training mapping!")
+        tool_names = set()
+        for sample in samples:
+            tool_names.add(sample.expected_tool_name)
+            if sample.tools_json:
+                try:
+                    tools = json.loads(sample.tools_json)
+                    for tool in tools:
+                        if isinstance(tool, dict) and 'name' in tool:
+                            tool_names.add(tool['name'])
+                except json.JSONDecodeError:
+                    pass
+        fallback_mapping = {name: idx for idx, name in enumerate(sorted(tool_names))}
+        inference.set_tool_mapping(fallback_mapping)
+        if verbose:
+            log(f"Tool mapping built from samples", num_tools=len(fallback_mapping), tools=list(fallback_mapping.keys()))
+
     # Evaluate samples
     results: List[EvalResult] = []
     tool_counts: Dict[str, Dict[str, int]] = {}  # tool_name -> {correct, total}
@@ -397,7 +427,7 @@ def evaluate_tool_call_accuracy(
 
             # Evaluate each sample in batch (sequential for now, as generation is autoregressive)
             for sample in batch_samples:
-                result = evaluate_sample(inference, sample, max_steps, parse_raw_output)
+                result = evaluate_sample(inference, sample, max_steps, parse_raw_output, max_gen_len)
                 results.append(result)
 
                 # Track per-tool accuracy

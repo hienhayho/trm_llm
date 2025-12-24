@@ -217,6 +217,7 @@ class TRMInference:
                     eos_token_id=self.tokenizer.eos_token_id,
                     encoder_output=encoder_output,
                     action_logits=action_logits,
+                    bos_token_id=self.tokenizer.bos_token_id,
                 )
                 token_ids = response_ids[0].tolist()
                 response_text = self.tokenizer.decode(token_ids, skip_special_tokens=False)
@@ -254,6 +255,7 @@ class TRMInference:
                     eos_token_id=self.tokenizer.eos_token_id,
                     encoder_output=encoder_output,
                     action_logits=action_logits,
+                    bos_token_id=self.tokenizer.bos_token_id,
                 )
                 token_ids = param_ids[0].tolist()
                 param_text = self.tokenizer.decode(token_ids, skip_special_tokens=False)
@@ -417,7 +419,7 @@ class TRMInference:
         for step_idx, outputs in enumerate(outputs_per_step):
             action_probs = F.softmax(outputs["action_logits"][0], dim=-1)
             tool_probs = F.softmax(outputs["tool_logits"][0], dim=-1)
-            halt_prob = torch.sigmoid(outputs["halt_logit"][0]).item()
+            q_prob = torch.sigmoid(outputs["q_logit"][0]).item()
 
             action_id = action_probs.argmax().item()
             tool_id = tool_probs.argmax().item()
@@ -430,7 +432,7 @@ class TRMInference:
                     "tool_id": tool_id if action_id == 1 else None,
                     "tool_name": self.tool_id_to_name.get(tool_id) if action_id == 1 else None,
                     "tool_confidence": tool_probs[tool_id].item() if action_id == 1 else None,
-                    "halt_prob": halt_prob,
+                    "q_prob": q_prob,  # Q = correctness prediction (TRM paper)
                 }
             )
 
